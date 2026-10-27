@@ -109,6 +109,19 @@ def load_asr(model_name):
             print(f"[asr] {device} indisponível ({type(e).__name__}: {e}); tentando cpu", flush=True)
 
 
+def read_wav_16k(path):
+    """Our own mono 16-bit wavs as float32 at 16 kHz. Bypasses faster-whisper's PyAV decoding, which
+    breaks with newer PyAV releases (open() lost the metadata_errors argument)."""
+    import numpy as np
+
+    with wave.open(str(path), "rb") as w:
+        sr = w.getframerate()
+        x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768
+    if sr != 16000:  # linear resampling is plenty for speech recognition
+        x = np.interp(np.arange(0, len(x), sr / 16000), np.arange(len(x)), x).astype(np.float32)
+    return x
+
+
 def asr_main(wid, model_name, tasks, events):
     """ASR worker: transcribes finished parts (pt) so the client can check them without a local Whisper.
 
@@ -127,7 +140,7 @@ def asr_main(wid, model_name, tasks, events):
             continue
         events.put(("asr_start", wid, job_id, n))
         try:
-            segments, _ = model.transcribe(wav, language="pt")
+            segments, _ = model.transcribe(read_wav_16k(wav), language="pt")
             events.put(("heard", wid, job_id, n, " ".join(" ".join(s.text for s in segments).split())))
         except Exception as e:
             events.put(("asr_fail", wid, job_id, n, f"{type(e).__name__}: {e}"))
