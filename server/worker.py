@@ -65,21 +65,47 @@ def worker_main(wid, engine_name, tasks, events):
             events.put(("fail", wid, job_id, n, f"{type(e).__name__}: {e}"))
 
 
+def preload_cuda_libs():
+    """ctranslate2 dlopens cuBLAS/cuDNN by soname, but pip's nvidia-* wheels (where Colab's torch gets
+    them) are not on the loader path. Loading them by full path first makes those dlopens succeed."""
+    import ctypes
+    import glob
+    import site
+
+    libs = [lib for sp in site.getsitepackages() for pattern in ("nvidia/cublas/lib/lib*.so*", "nvidia/cudnn/lib/lib*.so*")
+            for lib in sorted(glob.glob(f"{sp}/{pattern}"))]
+    for _ in range(3):  # cuDNN sub-libraries depend on each other: retry the ones that failed
+        failed = []
+        for lib in libs:
+            try:
+                ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                failed.append(lib)
+        if not failed:
+            break
+        libs = failed
+
+
 def load_asr(model_name):
     """faster-whisper on cuda/float16, falling back to cpu/int8. Warmed up, because a missing CUDA
-    library (cuDNN, cuBLAS) only fails at the first transcription, not at load."""
+    library (cuDNN, cuBLAS) only fails at the first transcription, not at load.
+    Returns (model, device); device says why cuda was not used when it fell back."""
     import numpy as np
     from faster_whisper import WhisperModel
 
     options = [("cpu", "int8")] if os.environ.get("F5_DEVICE") == "cpu" else [("cuda", "float16"), ("cpu", "int8")]
+    if options[0][0] == "cuda":
+        preload_cuda_libs()
+    why = ""
     for device, compute in options:
         try:
             model = WhisperModel(model_name, device=device, compute_type=compute)
             list(model.transcribe(np.zeros(16000, np.float32), language="pt")[0])
-            return model, device
+            return model, device + why
         except Exception as e:
             if device == options[-1][0]:
                 raise
+            why = f" (cuda falhou: {type(e).__name__}: {str(e)[:160]})"
             print(f"[asr] {device} indisponível ({type(e).__name__}: {e}); tentando cpu", flush=True)
 
 
