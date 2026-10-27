@@ -66,7 +66,7 @@ while True:
     try:
         h = health()
         print(f"\r{int(time.time() - t0)}s · prontos: {engines_line(h)} (carregando um por vez)", end="")
-        if h["loading"] == 0:
+        if h["engines"][h["default_engine"]]["workers"] and h["loading"] == 0:  # slots exist and all loaded
             break
     except OSError:
         pass  # server still starting
