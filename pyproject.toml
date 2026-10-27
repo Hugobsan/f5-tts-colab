@@ -1,0 +1,16 @@
+[project]
+name = "f5tts-client"
+version = "0.1.0"
+description = "Client (CLI + lib) for the F5-TTS server running on Google Colab"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+f5tts = "f5tts.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["f5tts"]
