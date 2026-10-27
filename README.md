@@ -25,8 +25,8 @@ agente de vídeo ─► f5tts gerar ─HTTPS─► f5.hugobsan.com.br ─► clo
 | `server/f5_server.py` | API, fila, supervisor dos workers |
 | `server/worker.py` | processo worker: carrega um motor e gera as partes da fila dele |
 | `server/engines/` | um arquivo por motor de TTS (`f5`, `qwen3`, `chatterbox`), todos com o mesmo contrato (veja `engines/__init__.py`) |
-| `colab/f5_tts_server.ipynb` | notebook pronto para subir no Colab (embute todo o `server/`) |
-| `scripts/build_notebook.py` | regera o notebook depois de mudar o server ou um motor |
+| `colab/f5_tts_server.ipynb` | notebook para subir no Colab (busca o `server/` deste repositório no GitHub) |
+| `scripts/build_notebook.py` | regera o notebook quando as células mudam |
 | `f5tts/` | client: `client.py` (lib), `cli.py` (comando `f5tts`), `calibrate.py` (calibrador de pronúncia) |
 | `tests/` | testes do client e do calibrador contra um server falso (sem modelo) |
 
@@ -75,11 +75,11 @@ cloudflared tunnel token f5
 
 ### Atualizar o server no Colab
 
-Depois de mudar qualquer arquivo em `server/` (ou de um `git pull`):
-1. `python3 scripts/build_notebook.py` regera o `.ipynb`.
-2. No Colab: **Runtime → Disconnect and delete runtime** no notebook antigo.
-3. **File → Upload notebook** com o `.ipynb` novo (apague o antigo do Drive).
-4. Ligue o **Notebook access** dos Secrets para ele e use **Run all**.
+O notebook **não embute o server**: a célula 1 clona este repositório (<https://github.com/Hugobsan/f5-tts-colab>, público) ou faz pull dele. Para atualizar:
+1. Faça commit e `git push` da mudança em `server/`.
+2. No Colab, interrompa a célula 4 e rode de novo as células **1, 2 e 3**. A 1 puxa o código novo e mostra o commit em uso, e a 3 reinicia o server.
+
+Só é preciso subir o notebook de novo quando as **células** mudarem (`scripts/build_notebook.py`). Nesse caso: **Runtime → Disconnect and delete runtime** no antigo, **File → Upload notebook** com o novo, ligar o **Notebook access** dos Secrets e **Run all**.
 
 O client não precisa de nada: ele foi instalado em modo editável (`-e`), então já roda o código atual.
 
@@ -88,8 +88,8 @@ O client não precisa de nada: ele foi instalado em modo editável (`-e`), entã
 ## Toda sessão
 
 1. Abra o notebook no Colab, escolha os motores em `ENGINES` (célula 1) → **Runtime → Run all**.
-   - **Célula 1:** checa a GPU, instala os motores escolhidos (cada um no ambiente principal ou num venv próprio, se as dependências dele brigam com as dos outros), baixa o cloudflared e, com o F5, o checkpoint pt-BR (~1,3 GB). Leva ~2-4 min por motor.
-   - **Célula 2:** escreve os arquivos do server em `/content/server/`.
+   - **Célula 1:** configuração (`ENGINES`) e clone ou pull do código do server em `/content/repo/`.
+   - **Célula 2:** checa a GPU, instala os motores escolhidos (cada um no ambiente principal ou num venv próprio, se as dependências dele brigam com as dos outros), baixa o cloudflared e, com o F5, o checkpoint pt-BR (~1,3 GB). Leva ~2-4 min por motor.
    - **Célula 3:** sobe o server e o túnel e espera os workers carregarem, **um de cada vez**, e passarem no warmup. O server aceita jobs assim que o primeiro fica pronto. No fim imprime `✅ No ar: https://f5.hugobsan.com.br`, e avisa se algum worker quebrou.
    - **Célula 4:** fica em loop mostrando workers, fila, GPU, RAM, quebras e reinícios a cada minuto. **Deixe a aba aberta**, porque o Colab derruba sessões ociosas.
 2. Na sua máquina:
