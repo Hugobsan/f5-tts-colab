@@ -28,6 +28,7 @@ import os
 
 NAME = "chatterbox"
 SAMPLE_RATE = 24000
+RAM_MB = 5000  # estimate: 4.8 GB peak on CPU (pt-br checkpoint), not measured on Colab
 # Own venv: chatterbox-tts pins torch==2.6.0, torchaudio==2.6.0, transformers==5.2.0, numpy<2,
 # safetensors==0.5.3 and gradio==6.8.0; f5-tts==1.1.22 needs gradio>=6.15, so they can't share
 # Colab's env (and the pins would downgrade Colab's torch).

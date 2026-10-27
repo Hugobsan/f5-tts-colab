@@ -22,6 +22,7 @@ import os
 
 NAME = "qwen3"
 SAMPLE_RATE = 24000
+RAM_MB = 6000  # estimate: 11.8 GB peak on CPU fp32; fp16 on GPU should need about half, not measured on Colab
 PIP = "qwen-tts==0.1.1"
 MODEL = os.environ.get("QWEN3_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 

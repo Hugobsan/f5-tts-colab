@@ -1,14 +1,20 @@
-"""TTS server: HTTP job queue served by GPU worker processes, one or more TTS engines.
+"""TTS server: HTTP job queue served by GPU worker processes, engines loaded on demand.
 
 Each job is a list of texts (one per narration paragraph) for one engine. The texts go
 into that engine's queue and its workers pick them up in parallel, so a job finishes in
 roughly (total / workers) time. Every request answers in milliseconds: the client
 submits, polls and downloads, so nothing hits Cloudflare's 100 s limit.
 
+Engines: every engine in F5_INSTALLED is installed, but only the default one starts
+loaded (F5_WORKERS workers). A job for another engine makes the supervisor give it one
+worker, retiring default-engine workers until the RAM budget fits (a retired worker
+finishes the parts queued ahead of the retirement first). After F5_IDLE_UNLOAD seconds
+without use the extra engine is unloaded and the default engine refills.
+
 Workers load one at a time (loading peaks RAM) and a supervisor replaces any worker
 that dies after becoming ready, putting its in-flight part back in the queue. A worker
 that dies while loading is not retried: that is almost always lack of RAM, and it shows
-up in /health with the exit code.
+up in /health with the exit code (for an on-demand engine, its pending jobs fail with it).
 
 One more slot, "asr", runs faster-whisper (worker.asr_main) under the same supervisor: a job
 sent with transcribe=true gets each finished part queued for it, and the text comes back in
@@ -17,9 +23,11 @@ the job status as heard{n: text}, so the client checks parts without its own Whi
 Run:  F5_TOKEN=<secret> python run.py
 Config (env):
   F5_TOKEN            required
-  F5_ENGINES          engines and worker counts, first = default: "f5:auto", "f5:3,qwen3:1,chatterbox:1"
-                      (count "auto" = as many as free RAM/VRAM allow, sized for F5; no count = 1)
-  F5_WORKERS          legacy: same as F5_ENGINES="f5:<value>" when F5_ENGINES is unset
+  F5_INSTALLED        engines that may be requested, e.g. "f5,qwen3,chatterbox" (default: "f5")
+  F5_DEFAULT_ENGINE   engine loaded at startup and used when a job names none (default: first installed)
+  F5_WORKERS          workers of the default engine: "auto" (fit RAM/VRAM) or a number
+  F5_IDLE_UNLOAD      seconds an on-demand engine stays loaded without use (default 600)
+  F5_ENGINES          legacy "f5:auto,qwen3:1": names = F5_INSTALLED, first = default, its count = F5_WORKERS
   ENGINE_PYTHON_<n>   interpreter for engine <n> workers (its own venv); default: this Python
   F5_DEVICE           cuda | cpu (default: engine picks, cuda if available)
   F5_ASR_MODEL        faster-whisper model for the ASR slot (default "small"); "off" = no ASR
@@ -37,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -50,18 +59,23 @@ import engines
 from worker import asr_main, worker_main
 
 TOKEN = os.environ.get("F5_TOKEN", "")
-ENGINES = os.environ.get("F5_ENGINES") or f"f5:{os.environ.get('F5_WORKERS', 'auto')}"
+_LEGACY = [s.strip() for s in os.environ.get("F5_ENGINES", "").split(",") if s.strip()]
+INSTALLED = [n.strip() for n in (os.environ.get("F5_INSTALLED") or ",".join(s.partition(":")[0] for s in _LEGACY)
+                                 or "f5").split(",") if n.strip()]
+DEFAULT = os.environ.get("F5_DEFAULT_ENGINE") or INSTALLED[0]
+WORKERS = os.environ.get("F5_WORKERS") or (_LEGACY[0].partition(":")[2] if _LEGACY else "") or "auto"
+IDLE_UNLOAD = int(os.environ.get("F5_IDLE_UNLOAD", "600"))
 ASR_MODEL = os.environ.get("F5_ASR_MODEL", "small")
 ASR = "asr"  # slot "engine" name of the ASR worker
 JOBS_DIR = Path(os.environ.get("F5_JOBS_DIR", "/content/jobs"))
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_REF_BYTES = 10 * 1024 * 1024
-# ponytail: per-worker cost from one Colab T4 run of F5 (~0.9 GB VRAM idle; 6 workers on 12.7 GB RAM lost 2).
-# Recalibrate from /health ram.workers_rss_mb and gpu.mem_used_mb if auto picks badly.
-RAM_PER_WORKER_MB = 2500
+# ponytail: per-worker costs are estimates (F5 measured ~2.3 GB RSS on a T4; engines declare RAM_MB);
+# recalibrate from /health ram.workers_rss_mb and gpu.mem_used_mb if the supervisor packs badly.
+DEFAULT_RAM_MB = 2500
 VRAM_PER_WORKER_MB = 2000
-# ponytail: estimate for faster-whisper small (float16) + CUDA libs, not measured on Colab; check /health asr.rss_mb
 ASR_RAM_MB = 1500
+RESERVE_MB = 500  # kept free for the server itself (with 4 F5 + ASR a T4 session still had ~4.9 GB free)
 MAX_AUTO_WORKERS = 8
 MAX_RESTARTS = 5
 
@@ -70,22 +84,32 @@ class JobIn(BaseModel):
     texts: list[str] = Field(min_length=1, max_length=2000)
     ref_audio: str = Field(description="reference wav, base64")
     ref_text: str = Field(min_length=1)
-    engine: str | None = Field(None, description="engine id; default = first in F5_ENGINES")
+    engine: str | None = Field(None, description="engine id; default = F5_DEFAULT_ENGINE; others load on demand")
     nfe: int = Field(32, ge=1, le=64)
     speed: float = Field(1.0, ge=0.5, le=2.0)
     opts: dict = Field(default_factory=dict, description="engine-specific options")
     transcribe: bool = Field(False, description="transcribe each finished part with the ASR worker (status heard{})")
 
 
-# slot status: waiting -> loading -> ready (-> waiting again if it dies) | broken
-state = {"slots": [], "engines": {}, "default": None, "ctx": None, "tasks": {}, "events": None, "stopping": False}
+# slot status: waiting -> loading -> ready (-> waiting again if it dies) | broken | retired
+state = {"slots": {}, "next_wid": 0, "want": {}, "pills": {}, "last_used": {}, "engine_errors": {},
+         "budget": 0, "n_default": 1, "ctx": None, "tasks": {}, "events": None, "stopping": False}
 jobs: dict[str, dict] = {}
 lock = threading.Lock()
 
 
-def new_slot(engine):
-    return {"engine": engine, "proc": None, "status": "waiting", "device": None, "task": None,
-            "error": None, "restarts": 0, "last_death": None}
+def cost(engine):
+    if engine == ASR:
+        return ASR_RAM_MB
+    return getattr(engines.get(engine), "RAM_MB", DEFAULT_RAM_MB)
+
+
+def add_slot(engine):
+    wid = state["next_wid"]
+    state["next_wid"] += 1
+    state["slots"][wid] = {"engine": engine, "proc": None, "status": "waiting", "device": None, "task": None,
+                           "error": None, "restarts": 0, "last_death": None}
+    return wid
 
 
 def meminfo_mb(key):
@@ -117,28 +141,13 @@ def gpu_usage():
     return {"util_pct": util, "mem_used_mb": used, "mem_total_mb": total}
 
 
-def auto_workers():
-    """As many workers as free RAM and VRAM allow; 1 without a GPU."""
+def auto_workers(budget):
+    """Default-engine workers that fit the RAM budget and free VRAM; 1 without a GPU."""
     gpu = gpu_usage()
     if gpu is None:
         return 1
-    by_ram = (meminfo_mb("MemAvailable") - (ASR_RAM_MB if ASR_MODEL != "off" else 0)) // RAM_PER_WORKER_MB
     by_vram = (gpu["mem_total_mb"] - gpu["mem_used_mb"]) // VRAM_PER_WORKER_MB
-    return max(1, min(by_ram, by_vram, MAX_AUTO_WORKERS))
-
-
-def parse_engines(spec):
-    """'f5:auto,qwen3:1' -> {'f5': n, 'qwen3': 1} in order. 'auto' is only sized for a single engine."""
-    out = {}
-    for item in filter(None, (s.strip() for s in spec.split(","))):
-        name, _, count = item.partition(":")
-        engines.get(name)  # unknown name fails at startup, not at the first request
-        out[name] = count or "1"
-    if not out:
-        raise SystemExit("F5_ENGINES vazio")
-    for name, count in out.items():
-        out[name] = (auto_workers() if len(out) == 1 else 1) if count == "auto" else int(count)
-    return out
+    return max(1, min(budget // cost(DEFAULT), by_vram, MAX_AUTO_WORKERS))
 
 
 def exit_reason(code):
@@ -152,7 +161,51 @@ def asr_task(job_id, n):
 
 
 def asr_slot():
-    return next((s for s in state["slots"] if s["engine"] == ASR), None)
+    return next((s for s in state["slots"].values() if s["engine"] == ASR), None)
+
+
+def pending_parts(job):
+    return job["total"] - len(job["done"] | job["failed"].keys())
+
+
+def fit_want():
+    """Default engine back to its size, then shrunk (and least recently used extras dropped) to fit the budget."""
+    want = state["want"]
+    want[DEFAULT] = state["n_default"]
+    total = lambda: sum(cost(e) * n for e, n in want.items())  # noqa: E731
+    while total() > state["budget"] and want[DEFAULT] > 1:
+        want[DEFAULT] -= 1
+    extras = sorted((e for e, n in want.items() if e != DEFAULT and n), key=lambda e: state["last_used"].get(e, 0))
+    for e in extras[:-1]:  # never the most recent one: it is what was just asked for
+        if total() <= state["budget"]:
+            break
+        want[e] = 0
+        print(f"[tts] {e} descarregado para caber na RAM", flush=True)
+
+
+def request_engine(engine):
+    state["last_used"][engine] = time.time()
+    if engine != DEFAULT and not state["want"].get(engine):
+        state["want"][engine] = 1
+        state["engine_errors"].pop(engine, None)
+        fit_want()
+        print(f"[tts] carregando {engine} sob demanda; {DEFAULT} fica com {state['want'][DEFAULT]} worker(s)", flush=True)
+
+
+def engine_failed(engine, error):
+    """An on-demand engine could not load: fail its pending parts, give the RAM back to the default engine."""
+    state["want"][engine] = 0
+    state["pills"][engine] = 0
+    state["engine_errors"][engine] = error
+    for j in jobs.values():
+        if j["engine"] == engine:
+            for n in range(j["total"]):
+                if n not in j["done"] and n not in j["failed"]:
+                    j["failed"][n] = f"motor {engine} não carregou: {error}"
+    for wid in [w for w, s in state["slots"].items() if s["engine"] == engine and s["proc"] is None]:
+        del state["slots"][wid]
+    fit_want()
+    print(f"[tts] motor {engine} falhou ({error}); {DEFAULT} volta a {state['want'][DEFAULT]} worker(s)", flush=True)
 
 
 def requeue(slot, reason):
@@ -189,35 +242,95 @@ def start_worker(wid, s):
     s["status"] = "loading"
 
 
+def reap():
+    """Handles workers whose process is gone: retired ones leave, crashed ones restart or break."""
+    slots = state["slots"]
+    for wid, s in list(slots.items()):
+        p = s["proc"]
+        if p is None or p.is_alive():
+            continue
+        s["proc"] = None
+        if s["status"] == "retired":
+            del slots[wid]
+            continue
+        reason = exit_reason(p.exitcode)
+        if s["status"] == "loading":
+            # if the load raised, the collector overwrites this with the real error
+            s["status"], s["error"] = "broken", f"morreu ao carregar o modelo: {reason}"
+            print(f"[tts] worker {wid} ({s['engine']}) QUEBRADO: {s['error']}", flush=True)
+        elif s["status"] == "ready":
+            s["restarts"] += 1
+            s["last_death"] = reason
+            requeue(s, reason)
+            if s["restarts"] > MAX_RESTARTS:
+                s["status"], s["error"] = "broken", f"morreu {s['restarts']} vezes; último: {reason}"
+            else:
+                s["status"] = "waiting"
+            print(f"[tts] worker {wid} ({s['engine']}) morreu ({reason}); reinício {s['restarts']}/{MAX_RESTARTS}",
+                  flush=True)
+    for wid, s in list(slots.items()):  # an on-demand engine that broke gives its RAM back
+        if s["status"] == "broken" and s["proc"] is None and s["engine"] not in (DEFAULT, ASR):
+            engine_failed(s["engine"], s["error"])
+
+
+def unload_idle():
+    now = time.time()
+    for e, n in list(state["want"].items()):
+        if e == DEFAULT or not n:
+            continue
+        busy = any(j["engine"] == e and pending_parts(j) for j in jobs.values())
+        if not busy and now - state["last_used"].get(e, 0) > IDLE_UNLOAD:
+            state["want"][e] = 0
+            fit_want()
+            print(f"[tts] {e} ocioso há {IDLE_UNLOAD}s: descarregado; {DEFAULT} volta a {state['want'][DEFAULT]}", flush=True)
+
+
+def reconcile():
+    """Adds or retires workers until each engine has what state["want"] asks for."""
+    slots, want, pills = state["slots"], state["want"], state["pills"]
+    for e in set(want) | {s["engine"] for s in slots.values()} - {ASR}:
+        # a broken slot keeps its place (else a worker that dies loading for lack of RAM is recreated forever)
+        active = [w for w, s in slots.items() if s["engine"] == e and s["status"] in ("waiting", "loading", "ready", "broken")]
+        have, target = len(active) - pills.get(e, 0), want.get(e, 0)
+        for _ in range(target - have):
+            add_slot(e)
+        for _ in range(have - target):
+            idle = next((w for st in ("broken", "waiting") for w in active if slots[w]["status"] == st), None)
+            if idle is not None:  # holds no process: just drop it
+                del slots[idle]
+                active.remove(idle)
+            else:  # a worker of this engine exits when it takes this from the queue (after the parts ahead of it)
+                state["tasks"][e].put(None)
+                pills[e] = pills.get(e, 0) + 1
+
+
+def start_next():
+    """One worker loads at a time; on-demand engines first, and only when the RAM budget allows it."""
+    slots = state["slots"]
+    if any(s["status"] == "loading" for s in slots.values()):
+        return
+    live = sum(cost(s["engine"]) for s in slots.values()
+               if s["engine"] != ASR and s["proc"] is not None and s["proc"].is_alive())
+    waiting = sorted((w for w, s in slots.items() if s["status"] == "waiting"),
+                     key=lambda w: (slots[w]["engine"] != ASR, slots[w]["engine"] == DEFAULT, w))
+    for wid in waiting:
+        s = slots[wid]
+        if s["engine"] == ASR or live == 0 or live + cost(s["engine"]) <= state["budget"]:
+            start_worker(wid, s)
+            return
+
+
 def supervise():
-    """Starts workers one at a time and replaces the ones that die after ready."""
     while not state["stopping"]:
-        with lock:
-            for wid, s in enumerate(state["slots"]):
-                p = s["proc"]
-                if p is None or p.is_alive():
-                    continue
-                s["proc"] = None
-                reason = exit_reason(p.exitcode)
-                if s["status"] == "loading":
-                    # if the load raised, the collector overwrites this with the real error
-                    s["status"], s["error"] = "broken", f"morreu ao carregar o modelo: {reason}"
-                    print(f"[tts] worker {wid} ({s['engine']}) QUEBRADO: {s['error']}", flush=True)
-                elif s["status"] == "ready":
-                    s["restarts"] += 1
-                    s["last_death"] = reason
-                    requeue(s, reason)
-                    if s["restarts"] > MAX_RESTARTS:
-                        s["status"], s["error"] = "broken", f"morreu {s['restarts']} vezes; último: {reason}"
-                    else:
-                        s["status"] = "waiting"
-                    print(f"[tts] worker {wid} ({s['engine']}) morreu ({reason}); reinício {s['restarts']}/{MAX_RESTARTS}",
-                          flush=True)
-            if not any(s["status"] == "loading" for s in state["slots"]):
-                for wid, s in enumerate(state["slots"]):
-                    if s["status"] == "waiting":
-                        start_worker(wid, s)
-                        break
+        try:
+            with lock:
+                reap()
+                unload_idle()
+                reconcile()
+                start_next()
+        except Exception:  # a bug here must not silently stop supervision
+            traceback.print_exc()
+            sys.stderr.flush()
         time.sleep(1)
 
 
@@ -227,7 +340,9 @@ def collect():
         ev = state["events"].get()
         kind, wid = ev[0], ev[1]
         with lock:
-            s = state["slots"][wid]
+            s = state["slots"].get(wid)
+            if s is None:  # slot already gone (retired); job events below still apply
+                s = {"engine": None, "task": None}
             if kind == "ready":
                 s["status"], s["device"] = "ready", ev[2]
                 print(f"[tts] worker {wid} ({s['engine']}) pronto ({ev[2]})", flush=True)
@@ -235,6 +350,11 @@ def collect():
             if kind == "broken":
                 s["status"], s["error"] = "broken", ev[2]
                 print(f"[tts] worker {wid} ({s['engine']}) QUEBRADO: {ev[2]}", flush=True)
+                continue
+            if kind == "retired":
+                s["status"] = "retired"
+                state["pills"][s["engine"]] = max(0, state["pills"].get(s["engine"], 0) - 1)
+                print(f"[tts] worker {wid} ({s['engine']}) liberado", flush=True)
                 continue
             job_id, n = ev[2], ev[3]
             s["task"] = (job_id, n) if kind in ("start", "asr_start") else None
@@ -248,6 +368,7 @@ def collect():
                 job["done"].add(n)
                 job["gen_secs"] += ev[4]
                 job["audio_secs"] += ev[5]
+                state["last_used"][job["engine"]] = time.time()
                 if job["transcribe"]:
                     state["tasks"][ASR].put(asr_task(job_id, n))
             elif kind == "fail":
@@ -265,22 +386,27 @@ def collect():
 async def lifespan(_app):
     if not TOKEN:
         raise SystemExit("F5_TOKEN não definido")
+    for name in INSTALLED:
+        engines.get(name)  # unknown name fails at startup, not at the first request
+    if DEFAULT not in INSTALLED:
+        raise SystemExit(f"F5_DEFAULT_ENGINE={DEFAULT} não está em F5_INSTALLED={INSTALLED}")
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    counts = parse_engines(ENGINES)
+    budget = meminfo_mb("MemAvailable") - (ASR_RAM_MB if ASR_MODEL != "off" else 0) - RESERVE_MB
+    n_default = auto_workers(budget) if WORKERS == "auto" else int(WORKERS)
     ctx = mp.get_context("spawn")  # CUDA does not survive fork
-    tasks = {name: ctx.Queue() for name in counts}
-    slots = [new_slot(name) for name, n in counts.items() for _ in range(n)]
+    state.update(ctx=ctx, events=ctx.Queue(), tasks={name: ctx.Queue() for name in INSTALLED},
+                 budget=budget, n_default=n_default, want={DEFAULT: n_default})
     if ASR_MODEL != "off":
-        tasks[ASR] = ctx.Queue()
-        slots.insert(1, new_slot(ASR))  # right after the first TTS worker, so transcripts are available early
-    state.update(ctx=ctx, engines=counts, default=next(iter(counts)), events=ctx.Queue(), tasks=tasks, slots=slots)
-    print(f"[tts] motores {counts} (F5_ENGINES={ENGINES}), ASR {ASR_MODEL}, carregando um worker por vez", flush=True)
+        state["tasks"][ASR] = ctx.Queue()
+        add_slot(ASR)
+    print(f"[tts] instalados {INSTALLED}, padrão {DEFAULT} com {n_default} worker(s) (F5_WORKERS={WORKERS}), "
+          f"orçamento de RAM {budget} MB, ASR {ASR_MODEL}; carregando um worker por vez", flush=True)
     threading.Thread(target=collect, daemon=True).start()
     threading.Thread(target=supervise, daemon=True).start()
     yield
     state["stopping"] = True
     with lock:
-        for s in state["slots"]:
+        for s in state["slots"].values():
             if s["proc"] is not None:
                 s["proc"].terminate()
 
@@ -291,6 +417,10 @@ app = FastAPI(title="TTS server", lifespan=lifespan)
 def auth(x_token: str = Header("")):
     if not secrets.compare_digest(x_token.encode(), TOKEN.encode()):
         raise HTTPException(401, "token inválido")
+
+
+def engine_ready(engine):
+    return any(s["engine"] == engine and s["status"] == "ready" for s in state["slots"].values())
 
 
 def job_view(job_id, job):
@@ -304,8 +434,9 @@ def job_view(job_id, job):
     else:
         status = "queued"
     out = {
-        "job_id": job_id, "engine": job["engine"], "status": status, "total": total, "done": sorted(job["done"]),
-        "failed": job["failed"], "gen_secs": round(job["gen_secs"], 2), "audio_secs": round(job["audio_secs"], 2),
+        "job_id": job_id, "engine": job["engine"], "engine_ready": engine_ready(job["engine"]), "status": status,
+        "total": total, "done": sorted(job["done"]), "failed": job["failed"],
+        "gen_secs": round(job["gen_secs"], 2), "audio_secs": round(job["audio_secs"], 2),
     }
     if job["transcribe"]:
         out["heard"] = dict(sorted(job["heard"].items()))
@@ -324,23 +455,27 @@ def summarize(slots):
 @app.get("/health", dependencies=[Depends(auth)])
 def health():
     with lock:
-        slots = [s for s in state["slots"] if s["engine"] != ASR]  # TTS workers; the ASR slot has its own section
-        pending = sum(j["total"] - len(j["done"] | j["failed"].keys()) for j in jobs.values())
+        all_slots = state["slots"]
+        slots = [s for s in all_slots.values() if s["engine"] != ASR]  # TTS workers; the ASR slot has its own section
+        pending = sum(pending_parts(j) for j in jobs.values())
         pids = [s["proc"].pid for s in slots if s["proc"] is not None and s["proc"].is_alive()]
         a = asr_slot()
         asr = {"model": ASR_MODEL, "status": a["status"] if a else "off"}
         if a:
             asr.update(device=a["device"], rss_mb=rss_mb(a["proc"].pid) if a["proc"] is not None else None)
         out = {
-            "ok": True, "default_engine": state["default"], "engines_spec": ENGINES,
+            "ok": True, "default_engine": DEFAULT, "installed": INSTALLED,
             **summarize(slots),
-            "engines": {name: summarize([s for s in slots if s["engine"] == name]) for name in state["engines"]},
-            "broken": {wid: f"{s['engine']}: {s['error']}" for wid, s in enumerate(state["slots"]) if s["status"] == "broken"},
+            "engines": {name: {**summarize([s for s in slots if s["engine"] == name]),
+                               "wanted": state["want"].get(name, 0)} for name in INSTALLED},
+            "engine_errors": state["engine_errors"],
+            "broken": {wid: f"{s['engine']}: {s['error']}" for wid, s in all_slots.items() if s["status"] == "broken"},
             "restarts": {wid: {"engine": s["engine"], "count": s["restarts"], "last": s["last_death"]}
-                         for wid, s in enumerate(state["slots"]) if s["restarts"]},
+                         for wid, s in all_slots.items() if s["restarts"]},
             "devices": sorted({s["device"] for s in slots if s["status"] == "ready"}),
             "pending_parts": pending,
             "asr": asr,
+            "ram_budget_mb": state["budget"], "idle_unload_secs": IDLE_UNLOAD,
         }
     out["ram"] = {"available_mb": meminfo_mb("MemAvailable"), "total_mb": meminfo_mb("MemTotal"),
                   "workers_rss_mb": [rss_mb(pid) for pid in pids]}
@@ -350,9 +485,9 @@ def health():
 
 @app.post("/jobs", dependencies=[Depends(auth)])
 def create_job(body: JobIn):
-    engine = body.engine or state["default"]
-    if engine not in state["engines"]:
-        raise HTTPException(422, f"motor '{engine}' não está carregado neste server (carregados: {list(state['engines'])})")
+    engine = body.engine or DEFAULT
+    if engine not in INSTALLED:
+        raise HTTPException(422, f"motor '{engine}' não está instalado neste server (instalados: {INSTALLED})")
     texts = [t.strip() for t in body.texts]
     if not all(texts):
         raise HTTPException(422, "texto vazio na lista")
@@ -380,9 +515,10 @@ def create_job(body: JobIn):
             "retries": {}, "tasks": tasks, "gen_secs": 0.0, "audio_secs": 0.0,
             "transcribe": body.transcribe, "heard": {}, "asr_retries": {},
         }
+        request_engine(engine)
     for t in tasks:
         state["tasks"][engine].put(t)
-    return {"job_id": job_id, "engine": engine, "total": len(texts)}
+    return {"job_id": job_id, "engine": engine, "engine_ready": engine_ready(engine), "total": len(texts)}
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(auth)])

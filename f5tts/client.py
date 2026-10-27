@@ -153,9 +153,12 @@ class F5Client:
 
     def ensure_ready(self, engine=None):
         h = self.health()
-        if engine and "engines" in h:
-            if engine not in h["engines"]:
-                raise F5Error(f"modelo '{engine}' não está carregado no server (carregados: {list(h['engines'])})")
+        installed = h.get("installed", list(h.get("engines", {})))  # older servers list only loaded engines
+        if engine and installed:
+            if engine not in installed:
+                raise F5Error(f"modelo '{engine}' não está instalado no server (instalados: {installed})")
+            if "installed" in h and engine != h["default_engine"]:
+                return h  # on-demand engine: the server loads it when the job arrives
             h = {**h, **h["engines"][engine]}
         if h["ready"] == 0:
             if h["broken"]:
@@ -241,10 +244,15 @@ class F5Client:
 
         send(range(len(parts)))
         last_change = time.time()
+        loading = False  # engine still loading on the server (on-demand engines)
         try:
             while jobs or checking:
+                loading = False
                 for job_id, todo in list(jobs.items()):
                     st = self.status(job_id)
+                    loading = loading or st.get("engine_ready") is False
+                    if loading:
+                        last_change = time.time()  # loading an engine is progress, not a stall
                     if st["failed"]:
                         raise F5Error(f"partes falharam no server: {st['failed']}")
                     heard = st.get("heard", {})  # JSON keys: "n"
@@ -271,7 +279,8 @@ class F5Client:
                 if on_progress:
                     busy = {i for todo in jobs.values() for i in todo.values()} | {i for i, _ in checking.values()}
                     on_progress({"done": sum(b is not None and i not in busy for i, b in enumerate(best)),
-                                 "total": len(parts), "retries": sum(attempts) - len(parts)})
+                                 "total": len(parts), "retries": sum(attempts) - len(parts),
+                                 "loading": engine if loading else None})
                 if time.time() - last_change > stall_timeout:
                     raise F5Error(f"sem progresso há {stall_timeout}s (worker morto? veja `f5tts status`)")
                 if jobs or checking:

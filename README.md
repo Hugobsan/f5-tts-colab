@@ -75,11 +75,11 @@ cloudflared tunnel token f5
 
 ### Atualizar o server no Colab
 
-O notebook **não embute o server**: a célula 1 clona este repositório (<https://github.com/Hugobsan/f5-tts-colab>, público) ou faz pull dele. Para atualizar:
-1. Faça commit e `git push` da mudança em `server/`.
+O notebook é só um **lançador**: a célula 1 tem as configurações e clona este repositório (<https://github.com/Hugobsan/f5-tts-colab>, público) ou faz pull dele, e as células 2-4 rodam `colab/setup.py`, `colab/start.py` e `colab/monitor.py` do repo. Para atualizar qualquer coisa (server, motores, instalação):
+1. Faça commit e `git push`.
 2. No Colab, interrompa a célula 4 e rode de novo as células **1, 2 e 3**. A 1 puxa o código novo e mostra o commit em uso, e a 3 reinicia o server.
 
-Só é preciso subir o notebook de novo quando as **células** mudarem (`scripts/build_notebook.py`). Nesse caso: **Runtime → Disconnect and delete runtime** no antigo, **File → Upload notebook** com o novo, ligar o **Notebook access** dos Secrets e **Run all**.
+Só é preciso subir o notebook de novo se o próprio lançador mudar (`scripts/build_notebook.py`). Nesse caso: **Runtime → Disconnect and delete runtime** no antigo, **File → Upload notebook** com o novo, ligar o **Notebook access** dos Secrets e **Run all**.
 
 O client não precisa de nada: ele foi instalado em modo editável (`-e`), então já roda o código atual.
 
@@ -87,11 +87,16 @@ O client não precisa de nada: ele foi instalado em modo editável (`-e`), entã
 
 ## Toda sessão
 
-1. Abra o notebook no Colab, escolha os motores em `ENGINES` (célula 1) → **Runtime → Run all**.
-   - **Célula 1:** configuração (`ENGINES`) e clone ou pull do código do server em `/content/repo/`.
-   - **Célula 2:** checa a GPU, instala os motores escolhidos (cada um no ambiente principal ou num venv próprio, se as dependências dele brigam com as dos outros), baixa o cloudflared e, com o F5, o checkpoint pt-BR (~1,3 GB). Leva ~2-4 min por motor.
-   - **Célula 3:** sobe o server e o túnel e espera os workers carregarem, **um de cada vez**, e passarem no warmup. O server aceita jobs assim que o primeiro fica pronto. No fim imprime `✅ No ar: https://f5.hugobsan.com.br`, e avisa se algum worker quebrou.
+1. Abra o notebook no Colab → **Runtime → Run all**.
+   - **Célula 1:** configurações e clone ou pull do projeto em `/content/repo/`:
+     - `INSTALL = "f5,qwen3,chatterbox"`: motores instalados. Tire os que não for usar para a sessão subir mais rápido.
+     - `DEFAULT_ENGINE = "f5"`: o motor que sobe carregado e atende jobs sem `--modelo`.
+     - `WORKERS = "auto"`: quantos workers do motor padrão.
+   - **Célula 2:** checa a GPU e instala as dependências do server (inclusive o faster-whisper) e os motores de `INSTALL`, cada um no ambiente principal ou num venv próprio, se as dependências dele brigam com as dos outros. Com o F5, baixa o checkpoint pt-BR (~1,3 GB). Leva ~2-4 min por motor.
+   - **Célula 3:** sobe o server e o túnel e espera os workers do motor padrão e o Whisper carregarem, **um de cada vez**, e passarem no warmup. No fim imprime `✅ No ar: https://f5.hugobsan.com.br`, e avisa se algum worker quebrou.
    - **Célula 4:** fica em loop mostrando workers, fila, GPU, RAM, quebras e reinícios a cada minuto. **Deixe a aba aberta**, porque o Colab derruba sessões ociosas.
+
+**Motores sob demanda:** um job com `--modelo qwen3` (ou outro de `INSTALL`) faz o server liberar workers do motor padrão até caber na RAM e carregar o motor pedido. A primeira parte demora ~1 min a mais, porque inclui baixar os pesos na primeira vez, e o client mostra "carregando qwen3". Depois de 10 min sem uso (`F5_IDLE_UNLOAD`), ele é descarregado e o motor padrão volta ao tamanho original. Se o motor não carregar (falta de RAM, por exemplo), os jobs dele falham com o motivo, e o padrão segue funcionando.
 2. Na sua máquina:
    ```bash
    f5tts status      # exit 0 = pronto; mostra workers, RAM, GPU, quebrados e reinícios
@@ -142,7 +147,7 @@ f5tts gerar roteiro.txt saida.wav \
 | `--min-acerto` | 0.9 | fração mínima de palavras ouvidas (com `--validar`) |
 | `--tentativas` | 3 | máximo de gerações por parte (com `--validar`) |
 | `--relatorio` | | salva o relatório por parte em JSON |
-| `--modelo` | padrão do server | motor: `f5`, `qwen3`, `chatterbox` (só os carregados no Colab) |
+| `--modelo` | padrão do server | motor: `f5`, `qwen3`, `chatterbox` (qualquer um de `INSTALL`; os que não são o padrão carregam sob demanda) |
 | `--opcao CHAVE=VALOR` | | opção específica do motor, repetível (ex.: `--opcao exaggeration=0.7`) |
 | `--quieto` | | sem barra de progresso |
 
@@ -177,7 +182,7 @@ A nota compara letras, não som, e o Whisper tende a "corrigir" para a palavra e
 
 ### Conferência automática (`--validar`)
 
-O F5 às vezes escorrega: come uma palavra, emenda duas ou corta o fim. No teste, a mesma frase gerada 4 vezes saiu certa 2 vezes e errada 2. Com `--validar`, cada parte baixada é transcrita pelo `whisper-cli` local (modelo `ggml-small`, o mesmo do HyperFrames) e comparada com o texto original. A nota é a fração das palavras esperadas encontradas, em ordem, desconsiderando acentos, pontuação e números (o Whisper escreve "2026" onde o roteiro diz "dois mil e vinte e seis"). Abaixo de `--min-acerto`, a parte é regerada com outra seed, até `--tentativas`, e fica a melhor. As que terminam abaixo do mínimo aparecem com `⚠`, com o texto e o que foi ouvido.
+O F5 às vezes escorrega: come uma palavra, emenda duas ou corta o fim. No teste, a mesma frase gerada 4 vezes saiu certa 2 vezes e errada 2. Com `--validar`, cada parte é transcrita e comparada com o texto original. A transcrição roda **no server, na GPU** (faster-whisper `small`, worker próprio) quando o `/health` mostra o ASR pronto: o client recebe o texto junto com a parte, e o próprio comando avisa `conferência: Whisper do servidor`. Se o server não tiver ASR (`F5_ASR_MODEL=off` ou server antigo), ela cai no `whisper-cli` local (modelo `ggml-small`, o mesmo do HyperFrames). A nota é a fração das palavras esperadas encontradas, em ordem, desconsiderando acentos, pontuação e números (o Whisper escreve "2026" onde o roteiro diz "dois mil e vinte e seis"). Abaixo de `--min-acerto`, a parte é regerada com outra seed, até `--tentativas`, e fica a melhor. As que terminam abaixo do mínimo aparecem com `⚠`, com o texto e o que foi ouvido.
 
 Limites conhecidos: o próprio Whisper erra um pouco ("abre" × "abra"), e uma palavra perdida em 20 ainda passa nos 90%.
 
@@ -216,7 +221,7 @@ f5tts bench --voz ~/.claude/skills/f5-tts-voz/refs/theo --partes 8
 # 8 partes em 41.0s · áudio 61.8s · 1.51s de áudio por segundo · pico de GPU 74%
 ```
 
-Troque `F5_WORKERS` na célula 3 por um número, rode a célula de novo (ela reinicia o server) e repita. Fique com o valor que dá mais *segundos de áudio por segundo*. O `f5tts status` mostra `ram.workers_rss_mb` (RAM de cada worker). Se o auto escolher mal, ajuste `RAM_PER_WORKER_MB`/`VRAM_PER_WORKER_MB` no server com esses números.
+Troque `WORKERS` na célula 1 por um número, rode de novo as células 1-3 e repita. Fique com o valor que dá mais *segundos de áudio por segundo*. O `f5tts status` mostra `ram.workers_rss_mb` (RAM de cada worker). Se o auto escolher mal, ajuste o `RAM_MB` do motor (`server/engines/<motor>.py`) ou o `VRAM_PER_WORKER_MB` do server com esses números.
 
 ### Quando um worker morre
 
@@ -267,9 +272,9 @@ Todas as rotas exigem o header `x-token`.
 
 | rota | resposta |
 |---|---|
-| `GET /health` | `{default_engine, engines{nome: {workers, ready, loading, alive}}, workers, ready, loading, alive, broken{}, restarts{}, devices, pending_parts, ram, gpu}` |
-| `POST /jobs` `{texts[], ref_audio (wav base64), ref_text, engine?, nfe=32, speed=1.0, opts{}}` | `{job_id, engine, total}` |
-| `GET /jobs/{id}` | `{engine, status: queued\|running\|done\|error, total, done[], failed{}, gen_secs, audio_secs}` |
+| `GET /health` | `{default_engine, installed[], engines{nome: {workers, ready, loading, alive, wanted}}, engine_errors{}, workers, ready, loading, alive, broken{}, restarts{}, devices, pending_parts, asr{model, status, device, rss_mb}, ram_budget_mb, idle_unload_secs, ram, gpu}` |
+| `POST /jobs` `{texts[], ref_audio (wav base64), ref_text, engine?, nfe=32, speed=1.0, opts{}, transcribe=false}` | `{job_id, engine, engine_ready, total}`; um `engine` instalado mas não carregado é carregado na hora |
+| `GET /jobs/{id}` | `{engine, engine_ready, status: queued\|running\|done\|error, total, done[], failed{}, gen_secs, audio_secs, heard{n: texto}}` (`heard` só com `transcribe`) |
 | `GET /jobs/{id}/parts/{n}` | wav mono da parte `n` (quando pronta), na taxa do motor |
 | `DELETE /jobs/{id}` | apaga o job (partes ainda na fila são descartadas) |
 
@@ -280,8 +285,12 @@ Configuração do server por variáveis de ambiente:
 | variável | |
 |---|---|
 | `F5_TOKEN` | obrigatório |
-| `F5_ENGINES` | motores e workers, o 1º é o padrão: `f5:auto`, `f5:3,qwen3:1,chatterbox:1` (`auto` só com um motor; sem número = 1) |
-| `F5_WORKERS` | legado: equivale a `F5_ENGINES=f5:<valor>` |
+| `F5_INSTALLED` | motores que podem ser pedidos: `f5,qwen3,chatterbox` (padrão `f5`) |
+| `F5_DEFAULT_ENGINE` | motor carregado ao subir e usado sem `engine` (padrão: o 1º instalado) |
+| `F5_WORKERS` | workers do motor padrão: `auto` (cabe na RAM/VRAM) ou um número |
+| `F5_IDLE_UNLOAD` | segundos que um motor sob demanda fica carregado sem uso (padrão 600) |
+| `F5_ASR_MODEL` | modelo do faster-whisper do worker de ASR (padrão `small`); `off` desliga |
+| `F5_ENGINES` | legado: `f5:auto,qwen3:1` vira instalados = os nomes, padrão = o 1º, workers = o número dele |
 | `ENGINE_PYTHON_<motor>` | Python dos workers daquele motor (venv próprio); padrão: o mesmo do server |
 | `F5_DEVICE` | `cuda`/`cpu` (padrão: o motor escolhe) |
 | `F5_JOBS_DIR`, `PORT=8000` | |

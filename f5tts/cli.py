@@ -79,6 +79,8 @@ def pick_asr(client, what):
 
 def progress(st):
     extra = f" · {st['retries']} regeradas" if st["retries"] else ""
+    if st.get("loading"):
+        extra += f" · carregando {st['loading']} no server (~1 min na primeira vez)"
     print(f"\r  {st['done']}/{st['total']} partes{extra}  ", end="", file=sys.stderr, flush=True)
 
 

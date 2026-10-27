@@ -48,7 +48,11 @@ def worker_main(wid, engine_name, tasks, events):
     events.put(("ready", wid, str(getattr(model, "device", None) or os.environ.get("F5_DEVICE") or "auto")))
 
     while True:
-        job_id, n, text, ref, ref_text, opts, jobs_dir = tasks.get()
+        task = tasks.get()
+        if task is None:  # the supervisor is shrinking this engine's pool: free the RAM
+            events.put(("retired", wid))
+            return
+        job_id, n, text, ref, ref_text, opts, jobs_dir = task
         out = Path(jobs_dir) / job_id / f"{n}.wav"
         if not out.parent.exists():  # job deleted (cancelled) while queued
             continue

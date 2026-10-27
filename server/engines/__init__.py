@@ -5,6 +5,8 @@
     PIP: str                  # extra `pip install` args the Colab notebook runs for this engine
     VENV: bool (optional)     # True = install PIP in its own venv on Colab (pins that clash with other
                               # engines); workers then run under that venv's Python. Default False.
+    RAM_MB: int (optional)    # host RAM one loaded worker takes; the supervisor packs engines into the
+                              # RAM budget with it when loading on demand. Default 2500.
 
     load(device) -> model     # once per worker process; device is "cuda", "cpu" or None (= auto)
     warmup(model) -> None     # tiny end-to-end generation proving the pipeline works; raise on failure

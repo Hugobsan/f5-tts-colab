@@ -5,6 +5,7 @@ import os
 NAME = "f5"
 SAMPLE_RATE = 24000
 PIP = "f5-tts==1.1.22"
+RAM_MB = 2400  # measured RSS per worker on a Colab T4: 2244-2648 MB
 MODEL = os.environ.get("F5_MODEL", "F5TTS_Base")
 CKPT = os.environ.get("F5_CKPT", "/content/model/model_last.safetensors")
 
