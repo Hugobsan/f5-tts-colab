@@ -27,14 +27,16 @@ gpu = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdou
 assert gpu, "Sem GPU: Runtime > Change runtime type > T4 GPU, depois rode de novo"
 print(gpu)
 
-sh(f"pip install -q -r {SERVER_DIR}/requirements.txt")
+sh(f"pip install -q -r {SERVER_DIR}/requirements.txt uv")
 ENGINE_PYTHON = {}
 for n in names:
     meta = ENGINE_META[n]
     if meta["venv"]:  # pins that clash with other engines: own venv, its workers run under that Python
         venv = f"/content/venvs/{n}"
-        sh(f"test -x {venv}/bin/python || python -m venv {venv}")
-        sh(f"{venv}/bin/pip install -q numpy {meta['pip']}")
+        # uv, not `python -m venv`: Colab's Python has no ensurepip. Same interpreter as the server,
+        # because the worker talks to it through multiprocessing.
+        sh(f"test -x {venv}/bin/python || uv venv -q --python {sys.executable} {venv}")
+        sh(f"uv pip install -q --python {venv}/bin/python numpy {meta['pip']}")
         ENGINE_PYTHON[n] = f"{venv}/bin/python"
     else:
         sh(f"pip install -q {meta['pip']}")
