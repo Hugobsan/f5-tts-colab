@@ -1,4 +1,5 @@
 """Worker process: loads one engine, warms it up, then generates parts from that engine's queue.
+asr_main is the ASR worker: transcribes finished parts with faster-whisper.
 
 Imports only stdlib + numpy at module level, because a worker may run under a different
 Python (the engine's own venv on Colab, see ENGINE_PYTHON_<name> in f5_server.py).
@@ -58,3 +59,45 @@ def worker_main(wid, engine_name, tasks, events):
             events.put(("done", wid, job_id, n, time.time() - t0, secs))
         except Exception as e:
             events.put(("fail", wid, job_id, n, f"{type(e).__name__}: {e}"))
+
+
+def load_asr(model_name):
+    """faster-whisper on cuda/float16, falling back to cpu/int8. Warmed up, because a missing CUDA
+    library (cuDNN, cuBLAS) only fails at the first transcription, not at load."""
+    import numpy as np
+    from faster_whisper import WhisperModel
+
+    options = [("cpu", "int8")] if os.environ.get("F5_DEVICE") == "cpu" else [("cuda", "float16"), ("cpu", "int8")]
+    for device, compute in options:
+        try:
+            model = WhisperModel(model_name, device=device, compute_type=compute)
+            list(model.transcribe(np.zeros(16000, np.float32), language="pt")[0])
+            return model, device
+        except Exception as e:
+            if device == options[-1][0]:
+                raise
+            print(f"[asr] {device} indisponível ({type(e).__name__}: {e}); tentando cpu", flush=True)
+
+
+def asr_main(wid, model_name, tasks, events):
+    """ASR worker: transcribes finished parts (pt) so the client can check them without a local Whisper.
+
+    Runs in the server's own env (faster-whisper comes from server/requirements.txt), never an engine venv.
+    """
+    try:
+        model, device = load_asr(model_name)
+    except Exception as e:
+        events.put(("broken", wid, f"{type(e).__name__}: {e}"))
+        return
+    events.put(("ready", wid, device))
+
+    while True:
+        job_id, n, wav = tasks.get()
+        if not os.path.exists(wav):  # job deleted while queued
+            continue
+        events.put(("asr_start", wid, job_id, n))
+        try:
+            segments, _ = model.transcribe(wav, language="pt")
+            events.put(("heard", wid, job_id, n, " ".join(" ".join(s.text for s in segments).split())))
+        except Exception as e:
+            events.put(("asr_fail", wid, job_id, n, f"{type(e).__name__}: {e}"))

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import calibrate
 from .client import (CONFIG_PATH, WHISPER_MODEL, F5Client, F5Error, ServerDown, load_config,
-                     load_pronunciation, save_config, wav_duration, whisper_transcribe)
+                     load_pronunciation, save_config, server_asr, wav_duration, whisper_transcribe)
 
 STYLE_TAG = re.compile(r"^\[([\w-]+)\]\s*(.*)$")
 
@@ -65,6 +65,18 @@ def parse_opts(items):
     return opts
 
 
+def pick_asr(client, what):
+    """Prints which Whisper will check the parts: the server's (GPU) when ready, else the local whisper-cli."""
+    asr = server_asr(client.health())
+    if asr:
+        print(f"conferência: Whisper do servidor ({asr['model']}, {asr['device']})")
+    elif shutil.which("whisper-cli") and WHISPER_MODEL.is_file():
+        print("conferência: Whisper local (whisper-cli, CPU)")
+    else:
+        raise F5Error(f"{what} precisa do Whisper do servidor (F5_ASR_MODEL) ou do whisper-cli no PATH"
+                      f" e do modelo {WHISPER_MODEL}")
+
+
 def progress(st):
     extra = f" · {st['retries']} regeradas" if st["retries"] else ""
     print(f"\r  {st['done']}/{st['total']} partes{extra}  ", end="", file=sys.stderr, flush=True)
@@ -90,12 +102,12 @@ def cmd_status(a):
 def cmd_gerar(a):
     parts = parse_script(read_arg(a.entrada))
     refs = resolve_refs(a, {style for style, text in parts if text.strip()})
+    client = F5Client()
     validate = None
     if a.validar:
-        if not (shutil.which("whisper-cli") and WHISPER_MODEL.is_file()):
-            raise F5Error(f"--validar precisa do whisper-cli no PATH e do modelo {WHISPER_MODEL}")
-        validate = whisper_transcribe
-    st = F5Client().synthesize(
+        pick_asr(client, "--validar")
+        validate = whisper_transcribe  # fallback only: synthesize prefers the server's ASR
+    st = client.synthesize(
         parts, a.saida, refs, nfe=a.nfe, speed=a.speed, pause=a.pausa, sample_rate=a.sr,
         pronunciation=load_pronunciation(a.pronuncia) if a.pronuncia else None,
         validate=validate, min_score=a.min_acerto, max_attempts=a.tentativas,
@@ -166,7 +178,7 @@ def main():
     s.add_argument("--pausa", type=float, default=0.25, help="silêncio entre partes, em segundos")
     s.add_argument("--sr", type=int, help="reamostra a saída (ex.: 44100, usa ffmpeg)")
     s.add_argument("--pronuncia", help="TSV termo<TAB>como falar, aplicado só ao texto enviado ao modelo")
-    s.add_argument("--validar", action="store_true", help="confere cada parte com o Whisper local e regera as ruins")
+    s.add_argument("--validar", action="store_true", help="confere cada parte com o Whisper (do server, se houver; senão o local) e regera as ruins")
     s.add_argument("--min-acerto", type=float, default=0.9, help="fração mínima de palavras ouvidas (com --validar)")
     s.add_argument("--tentativas", type=int, default=3, help="máximo de gerações por parte (com --validar)")
     s.add_argument("--relatorio", help="salva o relatório por parte (JSON)")

@@ -3,7 +3,9 @@
 Covers: one job per style, the pronunciation dictionary reaching only the text
 sent, parts finishing out of order, a transient 502 from the tunnel, a part
 that fails validation being regenerated, joining in script order with the
-pause, and every job being deleted at the end.
+pause, and every job being deleted at the end. Runs twice: against a server without
+ASR (the local validate callable transcribes) and one whose /health reports ASR ready (jobs ask
+transcribe=true, the client waits for status heard{n} and never calls the local callable).
 """
 
 import io
@@ -38,9 +40,23 @@ def first_sample(wav_bytes):
 
 
 sent = []  # every text the server received; a part's wav carries its index here
-jobs = {}  # job_id -> {"ids": [...], "polls": n}
+jobs = {}  # job_id -> {"ids": [...], "polls": n, "transcribe": bool}
 deleted = []
 flaky = {"left": 1}
+server = {"asr": False}
+
+# what whisper "hears": the original term (c) or the respelling itself (d) must both pass
+ORIGINAL = {"a primeira": "a primeira", "b segunda": "b segunda",
+            "c abre o pi ar": "c abre o PR", "d um pul riquést": "d um pul riquest"}
+heard_b = {"n": 0}
+
+
+def hear(text):
+    if text == "b segunda":
+        heard_b["n"] += 1
+        if heard_b["n"] == 1:
+            return "algo totalmente diferente"  # first take of b "sounds wrong"
+    return ORIGINAL[text]
 
 
 class Fake(BaseHTTPRequestHandler):
@@ -59,7 +75,10 @@ class Fake(BaseHTTPRequestHandler):
         if self.headers.get("x-token") != "t":
             return self.reply(401, {"detail": "token"})
         if self.path == "/health":
-            return self.reply(200, {"ready": 1, "workers": 1, "loading": 0, "broken": {}})
+            h = {"ready": 1, "workers": 1, "loading": 0, "broken": {}}
+            if server["asr"]:
+                h["asr"] = {"model": "small", "status": "ready", "device": "cuda"}
+            return self.reply(200, h)
         parts = self.path.strip("/").split("/")
         job = jobs[parts[1]]
         if len(parts) == 4:
@@ -70,12 +89,17 @@ class Fake(BaseHTTPRequestHandler):
             return self.reply(502, {"detail": "bad gateway"})
         total = len(job["ids"])
         done = list(range(total))[::-1][:job["polls"]]  # out of order, one more per poll
-        return self.reply(200, {"status": "running", "total": total, "done": done, "failed": {}})
+        st = {"status": "running", "total": total, "done": done, "failed": {}}
+        if job["transcribe"]:  # transcripts lag one poll behind done, so the client has to wait for them
+            for n in list(range(total))[::-1][:job["polls"] - 1]:
+                job["heard"].setdefault(str(n), hear(sent[job["ids"][n]]))
+            st["heard"] = job["heard"]
+        return self.reply(200, st)
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         job_id = f"j{len(jobs) + 1}"
-        jobs[job_id] = {"ids": [], "polls": 0}
+        jobs[job_id] = {"ids": [], "polls": 0, "transcribe": body.get("transcribe", False), "heard": {}}
         for t in body["texts"]:
             jobs[job_id]["ids"].append(len(sent))
             sent.append(t)
@@ -94,8 +118,10 @@ def check_scoring():
     assert match_score("Nos próximos vídeos vamos explorar os recursos.", "Nos próximos vídeos explorar os recursos.") < 0.9
 
 
-def main():
-    check_scoring()
+def run(asr):
+    sent.clear(), jobs.clear(), deleted.clear()
+    flaky["left"], heard_b["n"], server["asr"] = 1, 0, asr
+    local_calls = []
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory() as tmp:
@@ -105,18 +131,9 @@ def main():
         tsv.write_text("# comentário\nPR\tpi ar\npull request\tpul riquést\n")
         out = Path(tmp) / "out.wav"
 
-        # what whisper "hears": the original term (c) or the respelling itself (d) must both pass
-        original = {"a primeira": "a primeira", "b segunda": "b segunda",
-                    "c abre o pi ar": "c abre o PR", "d um pul riquést": "d um pul riquest"}
-        heard_b = {"n": 0}
-
         def fake_whisper(wav):
-            text = original[sent[first_sample(wav)]]
-            if text == "b segunda":
-                heard_b["n"] += 1
-                if heard_b["n"] == 1:
-                    return "algo totalmente diferente"  # first take of b "sounds wrong"
-            return text
+            local_calls.append(1)
+            return hear(sent[first_sample(wav)])
 
         c = F5Client(f"http://127.0.0.1:{srv.server_address[1]}", "t", retries=2)
         st = c.synthesize(
@@ -130,6 +147,10 @@ def main():
         assert sorted(deleted) == ["j1", "j2", "j3"], deleted
         assert st["retries"] == 1 and not st["below_min"], st
         assert [p["attempts"] for p in st["parts"]] == [1, 2, 1, 1]
+        assert st["parts"][3]["heard"] == "d um pul riquest", st["parts"]
+        assert st["asr"] == ("server" if asr else "local"), st["asr"]
+        assert all(j["transcribe"] == asr for j in jobs.values()), jobs
+        assert len(local_calls) == (0 if asr else 5), local_calls
 
         with wave.open(str(out)) as w:
             samples = [int.from_bytes(w.readframes(1), "little", signed=True) for _ in range(w.getnframes())]
@@ -139,6 +160,12 @@ def main():
             expected += (gap if i else []) + [sid] * FRAMES
         assert samples == expected, "wrong order, take or pause"
     srv.shutdown()
+
+
+def main():
+    check_scoring()
+    run(asr=False)  # old server / F5_ASR_MODEL=off: the local callable transcribes
+    run(asr=True)  # server ASR ready: transcripts come from status heard{}
     print("ok")
 
 

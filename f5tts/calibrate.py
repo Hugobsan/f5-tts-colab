@@ -1,17 +1,17 @@
 """Pronunciation calibrator: picks the respelling of an English term that Whisper hears as the original.
 
-Each candidate respelling is spoken inside a carrier sentence, transcribed with the local Whisper and
-scored by how well the ORIGINAL term shows up in what was heard. The raw term is always a candidate,
-so a respelling only wins if it beats letting the model read the term as is.
+Each candidate respelling is spoken inside a carrier sentence, transcribed (by the server's ASR when it
+has one, else the local Whisper) and scored by how well the ORIGINAL term shows up in what was heard.
+The raw term is always a candidate, so a respelling only wins if it beats letting the model read the
+term as is.
 """
 
 import difflib
-import shutil
 import statistics
 import time
 from pathlib import Path
 
-from .client import WHISPER_MODEL, F5Client, F5Error, match_score, whisper_transcribe, words
+from .client import F5Client, F5Error, match_score, server_asr, whisper_transcribe, words
 
 CARRIER = "hoje vamos falar sobre {} com calma."
 BROKEN_CARRIER = 0.75  # carrier score below this = the take garbled the sentence, rank the candidate last
@@ -40,7 +40,10 @@ def _slug(text):
 
 def calibrate(client, term, candidates, ref_wav, ref_text, *, carrier=CARRIER, takes=2, engine=None, nfe=32,
               transcribe=whisper_transcribe, save_dir=None, poll=2.0, stall_timeout=900):
-    """Ranks respellings of `term` (best first). Returns [{spelling, baseline, term, carrier, broken, takes}]."""
+    """Ranks respellings of `term` (best first). Returns [{spelling, baseline, term, carrier, broken, takes}].
+
+    Takes are transcribed by the server's ASR when it is ready; `transcribe` (wav bytes -> text) is the fallback.
+    """
     if carrier.count("{}") != 1:
         raise F5Error("a frase precisa ter exatamente um {} no lugar do termo")
     if takes < 1:
@@ -57,8 +60,8 @@ def calibrate(client, term, candidates, ref_wav, ref_text, *, carrier=CARRIER, t
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-    client.ensure_ready()
-    job_id = client.submit(texts, ref_wav, ref_text, nfe=nfe, engine=engine)["job_id"]
+    on_server = server_asr(client.ensure_ready()) is not None
+    job_id = client.submit(texts, ref_wav, ref_text, nfe=nfe, engine=engine, transcribe=on_server)["job_id"]
     results = {}  # n -> (term score, carrier score, heard)
     try:
         last_change = time.time()
@@ -66,14 +69,15 @@ def calibrate(client, term, candidates, ref_wav, ref_text, *, carrier=CARRIER, t
             st = client.status(job_id)
             if st["failed"]:
                 raise F5Error(f"partes falharam no server: {st['failed']}")
+            heard_on_server = st.get("heard", {})  # JSON keys: "n"
             for n in st["done"]:
-                if n in results:
+                if n in results or (on_server and str(n) not in heard_on_server):
                     continue
-                wav = client.part(job_id, n)
                 ci, take = divmod(n, takes)
+                wav = client.part(job_id, n) if save_dir or not on_server else None  # server ASR: no download
                 if save_dir:
                     (save_dir / f"{_slug(term)}__{ci:02d}-{_slug(cands[ci])}__t{take + 1}.wav").write_bytes(wav)
-                heard = transcribe(wav)
+                heard = heard_on_server[str(n)] if on_server else transcribe(wav)
                 results[n] = (term_score(term, heard), match_score(carrier_text, heard), heard)
                 last_change = time.time()
             if time.time() - last_change > stall_timeout:
@@ -119,14 +123,14 @@ def update_tsv(path, term, spelling):
 
 
 def cmd_pronuncia(a):
-    from .cli import resolve_refs  # lazy: cli.py imports this module to call register()
+    from .cli import pick_asr, resolve_refs  # lazy: cli.py imports this module to call register()
 
     if a.tentativas < 1:
         raise F5Error("--tentativas precisa ser >= 1")
-    if not (shutil.which("whisper-cli") and WHISPER_MODEL.is_file()):
-        raise F5Error(f"pronuncia precisa do whisper-cli no PATH e do modelo {WHISPER_MODEL}")
     ref_wav, ref_text = resolve_refs(a, {""})[""]
-    ranking = calibrate(F5Client(), a.termo, a.candidatos, ref_wav, ref_text, carrier=a.frase,
+    client = F5Client()
+    pick_asr(client, "pronuncia")
+    ranking = calibrate(client, a.termo, a.candidatos, ref_wav, ref_text, carrier=a.frase,
                         takes=a.tentativas, engine=a.modelo, nfe=a.nfe, transcribe=whisper_transcribe,
                         save_dir=a.saida_dir)
 

@@ -99,6 +99,15 @@ def whisper_transcribe(wav_bytes, model=WHISPER_MODEL):
     return " ".join(out.split())
 
 
+def server_asr(health):
+    """The /health `asr` section when the server can transcribe parts (faster-whisper on its GPU), else None.
+
+    None on servers without ASR (older ones, or F5_ASR_MODEL=off) and while it is loading or broken.
+    """
+    asr = health.get("asr") or {}
+    return asr if asr.get("status") == "ready" else None
+
+
 class F5Client:
     def __init__(self, url=None, token=None, timeout=30, retries=3):
         cfg_url, cfg_token = load_config()
@@ -154,8 +163,9 @@ class F5Client:
             raise ServerDown(f"server no ar mas nenhum worker pronto ainda ({h['loading']}/{h['workers']} carregando, um por vez)")
         return h
 
-    def submit(self, texts, ref_audio, ref_text, nfe=32, speed=1.0, engine=None, opts=None):
-        """engine: server engine id (None = server default); opts: engine-specific extras."""
+    def submit(self, texts, ref_audio, ref_text, nfe=32, speed=1.0, engine=None, opts=None, transcribe=False):
+        """engine: server engine id (None = server default); opts: engine-specific extras.
+        transcribe: the server's ASR transcribes each finished part (status()["heard"]{"n": text})."""
         body = {
             "texts": list(texts), "ref_text": ref_text, "nfe": nfe, "speed": speed,
             "ref_audio": base64.b64encode(Path(ref_audio).read_bytes()).decode(),
@@ -164,6 +174,8 @@ class F5Client:
             body["engine"] = engine
         if opts:
             body["opts"] = opts
+        if transcribe:
+            body["transcribe"] = True
         return self._json("POST", "/jobs", body)
 
     def status(self, job_id):
@@ -183,9 +195,11 @@ class F5Client:
         parts: [(style, text)]; refs: {style: (ref_wav, ref_text)}. Each style is its own job, all in parallel.
         engine/opts: server engine id (None = server default) and its engine-specific options.
         pronunciation: rules from load_pronunciation, applied to the text sent (never to the text checked).
-        validate: callable wav_bytes -> heard text (e.g. whisper_transcribe). Parts whose match_score with the
-        original text is below min_score are regenerated (new random seed) up to max_attempts; the best
-        attempt is kept. Raises ServerDown/F5Error on failure; returns a per-part report.
+        validate: callable wav_bytes -> heard text (e.g. whisper_transcribe), turns checking on. When the
+        server has its own ASR ready (see server_asr) the parts are transcribed there instead and validate
+        is only the fallback; the report's "asr" says which ("server" | "local"). Parts whose match_score
+        with the original text is below min_score are regenerated (new random seed) up to max_attempts; the
+        best attempt is kept. Raises ServerDown/F5Error on failure; returns a per-part report.
         """
         parts = [(style, text.strip()) for style, text in parts if text.strip()]
         if not parts:
@@ -194,20 +208,22 @@ class F5Client:
         if unknown:
             raise F5Error(f"estilo sem ref: {sorted(unknown)} (disponíveis: {sorted(refs)})")
         spoken = [apply_pronunciation(text, pronunciation) for _, text in parts]
-        self.ensure_ready(engine)
+        on_server = validate is not None and server_asr(self.ensure_ready(engine)) is not None
         t0 = time.time()
         jobs = {}  # job_id -> {n: part index} still to download
         attempts = [0] * len(parts)
         best = [None] * len(parts)  # (score, wav, heard)
         checking = {}  # future -> (part index, wav)
-        pool = ThreadPoolExecutor(2) if validate else None
+        retry = []
+        pool = ThreadPoolExecutor(2) if validate and not on_server else None
 
         def send(indexes):
             by_style = {}
             for i in indexes:
                 by_style.setdefault(parts[i][0], []).append(i)
             for style, ii in by_style.items():
-                job_id = self.submit([spoken[i] for i in ii], *refs[style], nfe, speed, engine, opts)["job_id"]
+                job_id = self.submit([spoken[i] for i in ii], *refs[style], nfe, speed, engine, opts,
+                                     transcribe=on_server)["job_id"]
                 jobs[job_id] = dict(enumerate(ii))
                 for i in ii:
                     attempts[i] += 1
@@ -215,6 +231,13 @@ class F5Client:
         def keep(i, wav, score, heard):
             if best[i] is None or score > best[i][0]:
                 best[i] = (score, wav, heard)
+
+        def check(i, wav, heard):
+            # dictionary on both sides: "deploy" heard counts like "diplói", "comit" like "comít"
+            score = match_score(spoken[i], apply_pronunciation(heard, pronunciation))
+            keep(i, wav, score, heard)
+            if score < min_score and attempts[i] < max_attempts:
+                retry.append(i)
 
         send(range(len(parts)))
         last_change = time.time()
@@ -224,28 +247,26 @@ class F5Client:
                     st = self.status(job_id)
                     if st["failed"]:
                         raise F5Error(f"partes falharam no server: {st['failed']}")
+                    heard = st.get("heard", {})  # JSON keys: "n"
                     for n in st["done"]:
-                        if n in todo:
+                        if n in todo and (not on_server or str(n) in heard):
                             i, wav = todo.pop(n), self.part(job_id, n)
                             last_change = time.time()
-                            if pool:
+                            if on_server:
+                                check(i, wav, heard[str(n)])
+                            elif pool:
                                 checking[pool.submit(validate, wav)] = (i, wav)
                             else:
                                 keep(i, wav, 1.0, None)
                     if not todo:
                         del jobs[job_id]
                         self._forget(job_id)
-                retry = []
                 for fut in [f for f in checking if f.done()]:
                     i, wav = checking.pop(fut)
-                    heard = fut.result()
-                    # dictionary on both sides: "deploy" heard counts like "diplói", "comit" like "comít"
-                    score = match_score(spoken[i], apply_pronunciation(heard, pronunciation))
-                    keep(i, wav, score, heard)
-                    if score < min_score and attempts[i] < max_attempts:
-                        retry.append(i)
+                    check(i, wav, fut.result())
                 if retry:
                     send(retry)
+                    retry.clear()
                     last_change = time.time()
                 if on_progress:
                     busy = {i for todo in jobs.values() for i in todo.values()} | {i for i, _ in checking.values()}
@@ -267,6 +288,7 @@ class F5Client:
         report = [{"n": i, "style": parts[i][0], "text": parts[i][1], "attempts": attempts[i],
                    "score": round(b[0], 3), "heard": b[2]} for i, b in enumerate(best)]
         return {"total": len(parts), "wall_secs": round(time.time() - t0, 2),
+                "asr": ("server" if on_server else "local") if validate else None,
                 "retries": sum(attempts) - len(parts), "parts": report,
                 "below_min": [r for r in report if r["score"] < min_score]}
 

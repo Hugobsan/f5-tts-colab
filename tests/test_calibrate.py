@@ -2,7 +2,9 @@
 
 Covers: the raw term always being a candidate, all candidates x takes in one job, ranking by how
 well the original term is heard (broken carrier last), wavs saved, the job deleted even on failure,
-update_tsv replace/append keeping comments, and the `pronuncia` CLI --salvar decision.
+update_tsv replace/append keeping comments, and the `pronuncia` CLI --salvar decision. With a
+server whose /health reports ASR ready: the job asks transcribe=true, the takes come from status
+heard{} (no local transcription, no wav download unless saving), and the CLI says which Whisper is used.
 """
 
 import argparse
@@ -14,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from f5tts import calibrate as cal  # noqa: E402
+from f5tts import cli  # noqa: E402
 from f5tts.client import F5Error  # noqa: E402
 
 # what the stub Whisper "hears" for each text sent to the model
@@ -27,24 +30,32 @@ HEARD = {
 
 
 class Stub:
-    def __init__(self, fail_at=None):
-        self.jobs, self.deleted, self.polls, self.fail_at = [], [], 0, fail_at
+    def __init__(self, fail_at=None, asr=False):
+        self.jobs, self.deleted, self.polls, self.fail_at, self.asr, self.downloads = [], [], 0, fail_at, asr, 0
+
+    def health(self):
+        return {"ready": 1, **({"asr": {"model": "small", "status": "ready", "device": "cuda"}} if self.asr else {})}
 
     def ensure_ready(self):
-        return {"ready": 1}
+        return self.health()
 
-    def submit(self, texts, ref_audio, ref_text, nfe=32, speed=1.0, engine=None, opts=None):
-        self.jobs.append({"texts": list(texts), "engine": engine, "nfe": nfe})
+    def submit(self, texts, ref_audio, ref_text, nfe=32, speed=1.0, engine=None, opts=None, transcribe=False):
+        self.jobs.append({"texts": list(texts), "engine": engine, "nfe": nfe, "transcribe": transcribe})
         return {"job_id": f"j{len(self.jobs)}"}
 
     def status(self, job_id):
         self.polls += 1
-        total = len(self.jobs[-1]["texts"])
+        job = self.jobs[-1]
+        order = list(range(len(job["texts"])))[::-1]  # out of order, 3 per poll
         if self.fail_at == self.polls:
             return {"done": [], "failed": {0: "boom"}}
-        return {"done": list(range(total))[::-1][:self.polls * 3], "failed": {}}  # out of order, 3 per poll
+        st = {"done": order[:self.polls * 3], "failed": {}}
+        if job["transcribe"]:  # server transcripts lag one poll behind done
+            st["heard"] = {str(n): HEARD[job["texts"][n]] for n in order[:(self.polls - 1) * 3]}
+        return st
 
     def part(self, job_id, n):
+        self.downloads += 1
         return self.jobs[-1]["texts"][n].encode()
 
     def delete(self, job_id):
@@ -97,6 +108,23 @@ def check_calibrate():
             pass
 
 
+def check_calibrate_server_asr():
+    stub = Stub(asr=True)
+
+    def no_local(wav):
+        raise AssertionError("server ASR is ready: the local Whisper must not run")
+
+    args = ("pull request", ["pôl riquést", "púl ri-quést", "pul riquést"], "ref.wav", "ref")
+    r = cal.calibrate(stub, *args, takes=2, transcribe=no_local, poll=0)
+    assert stub.jobs[0]["transcribe"] is True and stub.downloads == 0, stub.downloads
+    assert [x["spelling"] for x in r] == ["pul riquést", "pôl riquést", "pull request", "púl ri-quést"], r
+    assert r[0]["takes"] == ["hoje vamos falar sobre pull request com calma"] * 2
+    with tempfile.TemporaryDirectory() as tmp:  # saving the wavs still downloads them
+        stub = Stub(asr=True)
+        cal.calibrate(stub, *args, takes=2, transcribe=no_local, save_dir=tmp, poll=0)
+        assert stub.downloads == 8 and len(list(Path(tmp).iterdir())) == 8
+
+
 def check_update_tsv():
     with tempfile.TemporaryDirectory() as tmp:
         tsv = Path(tmp) / "p.tsv"
@@ -124,18 +152,19 @@ def check_cli():
     stub = Stub()
     cal.F5Client = lambda: stub
     cal.whisper_transcribe = fake_whisper
-    cal.shutil.which = lambda name: "/bin/true"
+    cli.shutil.which = lambda name: "/bin/true"
     cal.time.sleep = lambda s: None
     with tempfile.TemporaryDirectory() as tmp:
         ref, txt = Path(tmp) / "v-ref.wav", Path(tmp) / "v-ref.txt"
         ref.write_bytes(b"x")
         txt.write_text("ref text")
-        cal.WHISPER_MODEL = ref  # any existing file
+        cli.WHISPER_MODEL = ref  # any existing file
         tsv = Path(tmp) / "p.tsv"
         tsv.write_text("# c\n")
         out = run_cli(["pronuncia", "pull request", "pul riquést", "púl ri-quést", "--voz", str(Path(tmp) / "v")], tsv)
         assert "adicionado" in out and tsv.read_text() == "# c\npull request\tpul riquést\n", out
         assert "⚠" in out and "(cru)" in out, out
+        assert "Whisper local" in out, out
         # nothing beats the raw term -> nothing saved
         tsv.write_text("# c\n")
         out = run_cli(["pronuncia", "pull request", "púl ri-quést", "--voz", str(Path(tmp) / "v")], tsv)
@@ -146,10 +175,26 @@ def check_cli():
         except F5Error:
             pass
 
+        # server ASR ready: used even without a local whisper-cli
+        stub.__init__(asr=True)
+        cli.shutil.which = lambda name: None
+        tsv.write_text("# c\n")
+        out = run_cli(["pronuncia", "pull request", "pul riquést", "--voz", str(Path(tmp) / "v")], tsv)
+        assert "Whisper do servidor (small, cuda)" in out and "adicionado" in out, out
+        assert stub.jobs[-1]["transcribe"] is True
+        # neither server ASR nor local whisper-cli: clear error
+        stub.__init__()
+        try:
+            run_cli(["pronuncia", "pull request", "x", "--voz", str(Path(tmp) / "v")], tsv)
+            raise AssertionError("should have raised")
+        except F5Error as e:
+            assert "whisper-cli" in str(e), e
+
 
 if __name__ == "__main__":
     check_term_score()
     check_calibrate()
+    check_calibrate_server_asr()
     check_update_tsv()
     check_cli()
     print("ok")
