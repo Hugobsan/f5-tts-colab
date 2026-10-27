@@ -255,7 +255,9 @@ F5_URL=http://127.0.0.1:8000 F5_TOKEN=dev f5tts status
 # o mesmo, com o worker num venv diferente do server (como no Colab, com VENV=True no motor):
 #   server num venv só com fastapi/uvicorn/numpy + ENGINE_PYTHON_f5=~/.venvs/f5tts/bin/python
 
-# depois de mudar o server, regenere o notebook e suba de novo no Colab
+# depois de mudar o server: commit + push, e no Colab rode de novo as células 1-3
+git push
+# só se mudar as células do notebook: regenere e suba o .ipynb de novo
 python3 scripts/build_notebook.py
 ```
 
@@ -285,4 +287,4 @@ Configuração do server por variáveis de ambiente:
 | `F5_JOBS_DIR`, `PORT=8000` | |
 | `F5_MODEL`, `F5_CKPT` | do motor F5 (outros motores têm as suas, veja `engines/<motor>.py`) |
 
-**Novo motor:** crie `server/engines/<nome>.py` seguindo o contrato de `engines/__init__.py` (`NAME`, `SAMPLE_RATE`, `PIP`, `VENV`, `load`, `warmup`, `synth`), acrescente o nome em `AVAILABLE` e rode `scripts/build_notebook.py`. Um motor com dependências que brigam com as dos outros usa `VENV = True`, e o notebook instala ele num venv próprio.
+**Novo motor:** crie `server/engines/<nome>.py` seguindo o contrato de `engines/__init__.py` (`NAME`, `SAMPLE_RATE`, `PIP`, `VENV`, `load`, `warmup`, `synth`), acrescente o nome em `AVAILABLE`, faça push e use o nome em `ENGINES` no notebook. Um motor com dependências que brigam com as dos outros usa `VENV = True`, e o notebook instala ele num venv próprio.
