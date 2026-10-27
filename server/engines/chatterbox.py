@@ -28,13 +28,13 @@ import os
 
 NAME = "chatterbox"
 SAMPLE_RATE = 24000
-# --no-deps: chatterbox-tts pins torch==2.6.0, transformers==5.2.0 and gradio==6.8.0, which would
-# downgrade Colab's torch and clash with f5-tts (gradio>=6.15). These are its runtime imports.
-# setuptools<81: resemble-perth imports pkg_resources; without it perth.PerthImplicitWatermarker is
-# None and ChatterboxMultilingualTTS() fails with "'NoneType' object is not callable".
-PIP = ("--no-deps chatterbox-tts==0.1.7 s3tokenizer conformer==0.3.2 resemble-perth "
-       "diffusers==0.29.0 omegaconf pyloudnorm spacy-pkuseg pykakasi==2.3.0 setuptools<81 "
-       "onnx ml-dtypes srsly catalogue importlib-metadata zipp jaconv deprecated wrapt")  # their deps
+# Own venv: chatterbox-tts pins torch==2.6.0, torchaudio==2.6.0, transformers==5.2.0, numpy<2,
+# safetensors==0.5.3 and gradio==6.8.0; f5-tts==1.1.22 needs gradio>=6.15, so they can't share
+# Colab's env (and the pins would downgrade Colab's torch).
+# 'setuptools<81': resemble-perth imports pkg_resources; without it perth.PerthImplicitWatermarker
+# is None and ChatterboxMultilingualTTS() fails with "'NoneType' object is not callable".
+VENV = True
+PIP = "chatterbox-tts==0.1.7 'setuptools<81'"
 CHECKPOINT = os.environ.get("CHATTERBOX_CHECKPOINT", "pt-br")
 LANG = "pt"
 BASE_REPO = "ResembleAI/chatterbox"

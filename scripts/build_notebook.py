@@ -62,7 +62,7 @@ gpu = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdou
 assert gpu, "Sem GPU: Runtime > Change runtime type > T4 GPU, depois rode de novo"
 print(gpu)
 
-sh("pip install -q fastapi uvicorn")
+sh(f"pip install -q -r {SERVER_DIR}/requirements.txt")  # deps do server vêm do repo
 ENGINE_PYTHON = {}
 for n in names:
     meta = ENGINE_META[n]
