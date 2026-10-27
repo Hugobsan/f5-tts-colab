@@ -14,7 +14,7 @@ REPO = "https://github.com/Hugobsan/f5-tts-colab"
 
 INTRO = """# Servidor de TTS (pt-BR) no Colab
 
-Sobe os motores de voz (F5-TTS pt-BR e outros para comparar) na GPU do Colab e publica a API via Cloudflare Tunnel para o client `f5tts` da sua máquina. O código vem do GitHub a cada execução da célula 1: este notebook não precisa ser trocado quando o projeto muda.
+Sobe o motor de voz (Qwen3-TTS por padrão; F5-TTS pt-BR e Chatterbox disponíveis para comparar) na GPU do Colab e publica a API via Cloudflare Tunnel para o client `f5tts` da sua máquina. O código vem do GitHub a cada execução da célula 1: este notebook não precisa ser trocado quando o projeto muda.
 
 **Antes da primeira vez** (detalhes no README do projeto):
 1. *Runtime → Change runtime type → **T4 GPU*** (este notebook já pede GPU; confira).
@@ -30,8 +30,8 @@ Sobe os motores de voz (F5-TTS pt-BR e outros para comparar) na GPU do Colab e p
 """
 
 CONFIG = f"""# 1. Configuração + código do projeto (clona ou atualiza do GitHub)
-INSTALL = "f5,qwen3,chatterbox"            # motores instalados; os que não são o padrão carregam sob demanda
-DEFAULT_ENGINE = "f5"                      # sobe carregado e atende jobs sem --modelo
+INSTALL = "qwen3"                          # motores instalados ("qwen3,f5,chatterbox" para comparar); os extras carregam sob demanda
+DEFAULT_ENGINE = "qwen3"                   # sobe carregado e atende jobs sem --modelo (venceu o comparativo de 2026-10-27)
 WORKERS = "auto"                           # workers do motor padrão: "auto" (cabe na RAM/VRAM) ou um número
 PUBLIC_URL = "https://f5.hugobsan.com.br"  # hostname do túnel nomeado (usado só com CF_TUNNEL_TOKEN)
 REPO, BRANCH = "{REPO}", "main"

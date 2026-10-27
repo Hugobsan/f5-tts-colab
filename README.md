@@ -1,16 +1,28 @@
 # f5-tts-colab
 
-Narração pt-BR com voz clonada (F5-TTS) gerada na **GPU do Google Colab** e pedida da sua máquina por um client de linha de comando.
+Narração pt-BR com voz clonada gerada na **GPU do Google Colab** e pedida da sua máquina por um client de linha de comando. O modelo padrão é o **Qwen3-TTS**, e o F5-TTS pt-BR e o Chatterbox ficam disponíveis para comparar.
 
 ```
 sua máquina                                    Google Colab (T4)
 ───────────                                    ─────────────────
 agente de vídeo ─► f5tts gerar ─HTTPS─► f5.hugobsan.com.br ─► cloudflared ─► f5_server.py
-                    (client)    (Cloudflare Tunnel)                          ├─ fila de partes
-                    ├─ estilos por linha                                     ├─ supervisor
-                    ├─ dicionário de pronúncia                               ├─ worker 0 (modelo na GPU)
-                    └─ conferência pelo Whisper local                        └─ worker N…
+                    (client)    (Cloudflare Tunnel)                          ├─ fila de partes por motor
+                    ├─ estilos por linha                                     ├─ supervisor (sob demanda)
+                    ├─ dicionário de pronúncia                               ├─ workers do motor (GPU)
+                    └─ conferência (Whisper do server)                       └─ worker do Whisper (GPU)
 ```
+
+**Qual modelo (comparativo de 2026-10-27, mesmas 8 frases e mesmas referências do Theo):**
+
+| | F5 pt-BR | **Qwen3-TTS 1.7B** | Chatterbox pt-BR |
+|---|---|---|---|
+| acerto do Whisper | 97% | 98% | 97% |
+| avaliação de ouvido (👍 +1 / 😐 0 / 👎 −1) | +1 | **+7** | +3 |
+| termos em inglês ("pull request") | aproximados, precisa de dicionário | corretos, sem ajuda | corretos |
+| sotaque | neutro | puxa um pouco pro nordestino | carioca |
+| licença | não comercial | Apache 2.0 | MIT |
+
+Por isso o notebook sobe com `INSTALL = "qwen3"` e `DEFAULT_ENGINE = "qwen3"`. Para comparar de novo, use `INSTALL = "qwen3,f5,chatterbox"`: os extras carregam sob demanda.
 
 - **Server** (`server/f5_server.py`): FastAPI com fila de jobs. Cada linha do roteiro vira uma *parte*, e N processos worker (uma cópia do modelo cada) geram as partes em paralelo. Um supervisor sobe os workers um por vez e recria os que morrem.
 - **Client** (`f5tts/`): CLI + lib Python, só com stdlib. Checa se o server está no ar, envia os jobs, acompanha por polling, baixa as partes, confere cada uma com o Whisper, regera as ruins, junta na ordem e salva o `.wav`.
