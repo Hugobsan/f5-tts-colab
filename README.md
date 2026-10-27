@@ -19,7 +19,7 @@ agente de vídeo ─► f5tts gerar ─HTTPS─► f5.hugobsan.com.br ─► clo
 | acerto do Whisper | 97% | 98% | 97% |
 | avaliação de ouvido (👍 +1 / 😐 0 / 👎 −1) | +1 | **+7** | +3 |
 | termos em inglês ("pull request") | aproximados, precisa de dicionário | corretos, sem ajuda | corretos |
-| sotaque | neutro | puxa um pouco pro nordestino | carioca |
+| sotaque | neutro | neutro; raramente puxa pro nordestino no "d" | carioca |
 | licença | não comercial | Apache 2.0 | MIT |
 
 Por isso o notebook sobe com `INSTALL = "qwen3"` e `DEFAULT_ENGINE = "qwen3"`. Para comparar de novo, use `INSTALL = "qwen3,f5,chatterbox"`: os extras carregam sob demanda.
