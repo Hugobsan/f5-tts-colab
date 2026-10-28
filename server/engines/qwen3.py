@@ -22,10 +22,10 @@ import os
 
 NAME = "qwen3"
 SAMPLE_RATE = 24000
-RAM_MB = 6000  # estimate: 11.8 GB peak on CPU fp32; fp16 on GPU should need about half, not measured on Colab
-# ponytail: estimate (1.7B fp16 ≈ 3.5 GB weights + codec/activations), keeps "auto" from packing 4 on one T4;
-# recalibrate from /health gpu.mem_used_mb with 1 worker.
-VRAM_MB = 5000
+RAM_MB = 3000  # measured on Kaggle T4: 2.88-2.96 GB RSS per worker
+# measured ~4.3 GB per loaded worker on a T4 (4 workers + Whisper = 18 GB); the margin covers generation,
+# so "auto" puts 2 per T4: 2 on Colab, 4 on Kaggle's T4 x2. Raise it if a worker OOMs mid-job.
+VRAM_MB = 5500
 PIP = "qwen-tts==0.1.1"
 MODEL = os.environ.get("QWEN3_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 

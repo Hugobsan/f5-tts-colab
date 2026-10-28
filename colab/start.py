@@ -76,12 +76,15 @@ def engines_line(h):
     return " · ".join(f"{n} {e['ready']}/{e['workers']}" for n, e in h["engines"].items()) or "nenhum carregado"
 
 
-t0 = time.time()
+t0, last = time.time(), None
 while True:
     assert server.poll() is None, "server morreu:\n" + open("/content/server.log").read()[-3000:]
     try:
         h = health()
-        print(f"\r{int(time.time() - t0)}s · prontos: {engines_line(h)} (carregando um por vez)", end="")
+        line = f"prontos: {engines_line(h)} (carregando um por vez)"
+        if line != last:  # one line per change: Kaggle's "Save & Run All" log drops \r-rewritten lines
+            print(f"{int(time.time() - t0)}s · {line}", flush=True)
+            last = line
         if h["engines"][h["default_engine"]]["workers"] and h["loading"] == 0:  # slots exist and all loaded
             break
     except OSError:
