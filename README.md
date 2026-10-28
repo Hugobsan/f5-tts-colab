@@ -104,6 +104,8 @@ O mesmo notebook roda no Kaggle e detecta sozinho onde está. Vale para sessões
 3. *Add-ons → Secrets*: crie `F5_TOKEN` e `CF_TUNNEL_TOKEN` com os mesmos valores do Colab e marque o checkbox de cada um neste notebook.
 4. *Save Version → **Save & Run All***. Roda em segundo plano, sem aba aberta, e os logs aparecem na página da versão. Quando terminar, **cancele a execução**, porque a célula 4 roda em loop e gasta a cota até o limite de 12 h.
 
+**Desligar sem abrir o navegador:** `f5tts desligar`. O server sai, e a célula 4 libera a máquina: no Kaggle a execução termina, e no Colab o runtime é apagado (`runtime.unassign()`). Com partes na fila, ele recusa (HTTP 409), a menos que se use `--forcar`.
+
 **Um server por vez no mesmo túnel.** Com dois ligados, o Cloudflare reparte as requisições entre eles: um job enviado a um é consultado no outro, que responde 404. Por isso a célula 3 se recusa a subir se outro server ainda responder em `PUBLIC_URL`. Para trocar de plataforma: espere a narração em andamento acabar, desligue um e ligue o outro. A URL continua a mesma.
 
 ---

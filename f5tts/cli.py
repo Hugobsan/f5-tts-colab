@@ -101,6 +101,12 @@ def cmd_status(a):
         sys.exit(1)
 
 
+def cmd_desligar(a):
+    r = F5Client().shutdown(force=a.forcar)
+    print("server desligando; o notebook libera a máquina em até 1 min"
+          + (f" ({r['discarded_parts']} partes descartadas)" if r["discarded_parts"] else ""))
+
+
 def cmd_gerar(a):
     parts = parse_script(read_arg(a.entrada))
     refs = resolve_refs(a, {style for style, text in parts if text.strip()})
@@ -163,6 +169,10 @@ def main():
 
     s = sub.add_parser("status", help="checa se o server está no ar (exit 1 se não houver worker pronto)")
     s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("desligar", help="desliga o server e libera a máquina do Colab/Kaggle (recusa com partes na fila)")
+    s.add_argument("--forcar", action="store_true", help="desliga mesmo com partes na fila (descarta)")
+    s.set_defaults(fn=cmd_desligar)
 
     voice = argparse.ArgumentParser(add_help=False)
     voice.add_argument("--voz", help="prefixo dos refs: PREFIXO-ref.wav/.txt (padrão) e PREFIXO-<estilo>-ref.wav/.txt")

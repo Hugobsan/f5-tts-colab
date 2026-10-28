@@ -190,6 +190,10 @@ class F5Client:
     def delete(self, job_id):
         return self._json("DELETE", f"/jobs/{job_id}")
 
+    def shutdown(self, force=False):
+        """Stops the server and frees the Colab/Kaggle machine; HTTP 409 (F5Error) while parts are queued."""
+        return self._json("POST", "/shutdown" + ("?force=true" if force else ""))
+
     def synthesize(self, parts, out_wav, refs, nfe=32, speed=1.0, pause=0.25, sample_rate=None,
                    pronunciation=None, validate=None, min_score=0.9, max_attempts=3, engine=None, opts=None,
                    poll=2.0, stall_timeout=900, on_progress=None):

@@ -583,5 +583,19 @@ def delete_job(job_id: str):
     return {"deleted": job_id}
 
 
+@app.post("/shutdown", dependencies=[Depends(auth)])
+def shutdown(force: bool = False):
+    """Stops the server; the notebook's cell 4 sees it exit and releases the machine (Kaggle run ends,
+    Colab runtime is unassigned). Refuses while parts are queued unless force."""
+    with lock:
+        pending = sum(pending_parts(j) for j in jobs.values())
+    if pending and not force:
+        raise HTTPException(409, f"{pending} partes na fila; espere terminar ou use force")
+    # SIGTERM after the response goes out: uvicorn exits cleanly and the lifespan stops the workers
+    threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()
+    print(f"[tts] desligando a pedido do client ({pending} partes na fila descartadas)", flush=True)
+    return {"shutting_down": True, "discarded_parts": pending}
+
+
 def main():
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
