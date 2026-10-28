@@ -129,25 +129,48 @@ def rss_mb(pid):
     return None
 
 
-def gpu_usage():
+def gpus():
+    """One dict per GPU (Kaggle has 2 T4s, Colab 1); [] without nvidia-smi."""
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=3,
-        ).stdout.strip().splitlines()[0]
-    except (OSError, IndexError, subprocess.SubprocessError):
+        ).stdout.strip().splitlines()
+        rows = [[int(x) for x in line.split(", ")] for line in out]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    return [{"util_pct": u, "mem_used_mb": used, "mem_total_mb": total} for u, used, total in rows]
+
+
+def gpu_usage():
+    """All GPUs summed (util averaged), for /health."""
+    gs = gpus()
+    if not gs:
         return None
-    util, used, total = (int(x) for x in out.split(", "))
-    return {"util_pct": util, "mem_used_mb": used, "mem_total_mb": total}
+    return {"count": len(gs), "util_pct": sum(g["util_pct"] for g in gs) // len(gs),
+            "mem_used_mb": sum(g["mem_used_mb"] for g in gs), "mem_total_mb": sum(g["mem_total_mb"] for g in gs)}
+
+
+def vram(engine):
+    return getattr(engines.get(engine), "VRAM_MB", VRAM_PER_WORKER_MB)
 
 
 def auto_workers(budget):
-    """Default-engine workers that fit the RAM budget and free VRAM; 1 without a GPU."""
-    gpu = gpu_usage()
-    if gpu is None:
+    """Default-engine workers that fit the RAM budget and the free VRAM of each GPU; 1 without a GPU."""
+    gs = gpus()
+    if not gs:
         return 1
-    by_vram = (gpu["mem_total_mb"] - gpu["mem_used_mb"]) // VRAM_PER_WORKER_MB
+    by_vram = sum((g["mem_total_mb"] - g["mem_used_mb"]) // vram(DEFAULT) for g in gs)
     return max(1, min(budget // cost(DEFAULT), by_vram, MAX_AUTO_WORKERS))
+
+
+def pick_gpu(n_gpus):
+    """GPU with the fewest TTS workers; the ASR worker stays on GPU 0."""
+    load = [0] * n_gpus
+    for s in state["slots"].values():
+        if s.get("gpu") is not None and s["proc"] is not None and s["engine"] != ASR:
+            load[s["gpu"]] += 1
+    return load.index(min(load))
 
 
 def exit_reason(code):
@@ -238,7 +261,20 @@ def start_worker(wid, s):
     s["proc"] = state["ctx"].Process(
         target=asr_main if asr else worker_main,
         args=(wid, ASR_MODEL if asr else s["engine"], state["tasks"][s["engine"]], state["events"]), daemon=True)
-    s["proc"].start()
+    n_gpus = len(gpus())
+    s["gpu"] = None
+    if n_gpus > 1:  # spawned children inherit os.environ, so each sees only its own GPU (as cuda:0)
+        s["gpu"] = 0 if asr else pick_gpu(n_gpus)
+        old = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(s["gpu"])
+    try:
+        s["proc"].start()
+    finally:
+        if s["gpu"] is not None:
+            if old is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = old
     s["status"] = "loading"
 
 
@@ -344,8 +380,8 @@ def collect():
             if s is None:  # slot already gone (retired); job events below still apply
                 s = {"engine": None, "task": None}
             if kind == "ready":
-                s["status"], s["device"] = "ready", ev[2]
-                print(f"[tts] worker {wid} ({s['engine']}) pronto ({ev[2]})", flush=True)
+                s["status"], s["device"] = "ready", ev[2] + (f" gpu{s['gpu']}" if s.get("gpu") is not None else "")
+                print(f"[tts] worker {wid} ({s['engine']}) pronto ({s['device']})", flush=True)
                 continue
             if kind == "broken":
                 s["status"], s["error"] = "broken", ev[2]

@@ -95,6 +95,17 @@ Só é preciso subir o notebook de novo se o próprio lançador mudar (`scripts/
 
 O client não precisa de nada: ele foi instalado em modo editável (`-e`), então já roda o código atual.
 
+### Rodar no Kaggle em vez do Colab
+
+O mesmo notebook roda no Kaggle e detecta sozinho onde está. Vale para sessões longas: o Kaggle dá até 12 h por sessão (30 h de GPU por semana), duas T4 de 16 GB e ~29 GB de RAM. Lá o `WORKERS = "auto"` divide os workers entre as duas GPUs, com o Whisper na GPU 0.
+
+1. *Create → New Notebook → File → Import Notebook* com `colab/f5_tts_server.ipynb`.
+2. *Settings → Accelerator → **GPU T4 x2*** e *Settings → **Internet on***. A internet exige conta com telefone verificado.
+3. *Add-ons → Secrets*: crie `F5_TOKEN` e `CF_TUNNEL_TOKEN` com os mesmos valores do Colab e marque o checkbox de cada um neste notebook.
+4. *Save Version → **Save & Run All***. Roda em segundo plano, sem aba aberta, e os logs aparecem na página da versão. Quando terminar, **cancele a execução**, porque a célula 4 roda em loop e gasta a cota até o limite de 12 h.
+
+**Um server por vez no mesmo túnel.** Com dois ligados, o Cloudflare reparte as requisições entre eles: um job enviado a um é consultado no outro, que responde 404. Por isso a célula 3 se recusa a subir se outro server ainda responder em `PUBLIC_URL`. Para trocar de plataforma: espere a narração em andamento acabar, desligue um e ligue o outro. A URL continua a mesma.
+
 ---
 
 ## Toda sessão

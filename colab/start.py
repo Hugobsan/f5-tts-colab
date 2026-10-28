@@ -10,22 +10,38 @@ import sys
 import time
 import urllib.request
 
-from google.colab import userdata
+KAGGLE = os.path.isdir("/kaggle")
 
 
 def secret(name):
     try:
+        if KAGGLE:
+            from kaggle_secrets import UserSecretsClient
+            return UserSecretsClient().get_secret(name)
+        from google.colab import userdata
         return userdata.get(name)
     except Exception:  # secret missing or notebook access not granted
         return None
 
 
 F5_TOKEN = secret("F5_TOKEN")
-assert F5_TOKEN, "Crie o Secret F5_TOKEN (🔑 na barra lateral) e libere o acesso ao notebook"
+assert F5_TOKEN, ("Crie o Secret F5_TOKEN (Add-ons > Secrets) e marque o checkbox dele neste notebook" if KAGGLE
+                  else "Crie o Secret F5_TOKEN (🔑 na barra lateral) e libere o acesso ao notebook")
 CF_TUNNEL_TOKEN = secret("CF_TUNNEL_TOKEN")
 
 subprocess.run("pkill -f server/run.py; pkill -f multiprocessing.spawn; pkill -f 'cloudflared tunnel'", shell=True)  # re-run
 time.sleep(2)
+
+if CF_TUNNEL_TOKEN:
+    # Two servers on one tunnel split the requests: a job sent to one is polled on the other (404).
+    try:
+        req = urllib.request.Request(PUBLIC_URL + "/health", headers={"x-token": F5_TOKEN, "user-agent": "f5tts-client"})
+        urllib.request.urlopen(req, timeout=10).close()
+        other_up = True
+    except OSError:
+        other_up = False
+    assert not other_up, (f"Outro server (Colab ou Kaggle) ainda responde em {PUBLIC_URL}. "
+                          "Desligue-o e rode esta célula de novo: dois no mesmo túnel quebram os jobs.")
 env = dict(os.environ, F5_TOKEN=F5_TOKEN, F5_INSTALLED=INSTALL, F5_DEFAULT_ENGINE=DEFAULT_ENGINE,
            F5_WORKERS=str(globals().get("WORKERS", "auto")), PORT="8000",
            **{f"ENGINE_PYTHON_{n}": py for n, py in ENGINE_PYTHON.items()})

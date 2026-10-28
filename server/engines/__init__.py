@@ -7,6 +7,7 @@
                               # engines); workers then run under that venv's Python. Default False.
     RAM_MB: int (optional)    # host RAM one loaded worker takes; the supervisor packs engines into the
                               # RAM budget with it when loading on demand. Default 2500.
+    VRAM_MB: int (optional)   # GPU memory one loaded worker takes; "auto" fits workers per GPU with it. Default 2000.
 
     load(device) -> model     # once per worker process; device is "cuda", "cpu" or None (= auto)
     warmup(model) -> None     # tiny end-to-end generation proving the pipeline works; raise on failure
